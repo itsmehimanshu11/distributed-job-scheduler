@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler_password
+      POSTGRES_DB: scheduler_db
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - scheduler_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  scheduler_postgres_data:
