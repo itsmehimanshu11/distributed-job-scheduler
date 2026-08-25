@@ -23,6 +23,7 @@ Base.metadata.create_all(bind=engine)
 class JobCreate(BaseModel):
     name: str
     command: str
+    priority: int = Field(default=0, ge=0, le=100)
     max_retries: int = Field(default=3, ge=0, le=10)
 
 
@@ -50,14 +51,16 @@ def create_job(
     db: Session = Depends(get_db),
 ):
     job = Job(
-        name=job_data.name,
-        command=job_data.command,
-        status="pending",
-        attempts=0,
-        max_retries=job_data.max_retries,
-        last_error=None,
-        created_at=datetime.utcnow(),
-    )
+    name=job_data.name,
+    command=job_data.command,
+    status="pending",
+    attempts=0,
+    max_retries=job_data.max_retries,
+    priority=job_data.priority,
+    next_run_at=None,
+    last_error=None,
+    created_at=datetime.utcnow(),
+)
 
     db.add(job)
     db.commit()
@@ -70,6 +73,8 @@ def create_job(
         "status": job.status,
         "attempts": job.attempts,
         "max_retries": job.max_retries,
+        "priority": job.priority,
+        "next_run_at": job.next_run_at,
         "last_error": job.last_error,
         "created_at": job.created_at,
     }
@@ -87,6 +92,8 @@ def list_jobs(db: Session = Depends(get_db)):
             "status": job.status,
             "attempts": job.attempts,
             "max_retries": job.max_retries,
+            "priority": job.priority,
+            "next_run_at": job.next_run_at,
             "last_error": job.last_error,
             "created_at": job.created_at,
         }
@@ -114,6 +121,8 @@ def get_job(
         "status": job.status,
         "attempts": job.attempts,
         "max_retries": job.max_retries,
+        "priority": job.priority,
+        "next_run_at": job.next_run_at,
         "last_error": job.last_error,
         "created_at": job.created_at,
     }

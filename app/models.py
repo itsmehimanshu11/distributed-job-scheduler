@@ -40,6 +40,19 @@ class Job(Base):
         nullable=False,
     )
 
+    # Higher number = higher priority
+    priority: Mapped[int] = mapped_column(
+        default=0,
+        nullable=False,
+    )
+
+    # Job cannot be executed before this time.
+    # Used for retry backoff.
+    next_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
     last_error: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

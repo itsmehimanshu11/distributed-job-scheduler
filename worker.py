@@ -1,6 +1,8 @@
 import subprocess
 import time
 
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import create_engine, text
 
 
@@ -19,8 +21,13 @@ def claim_job():
     """
     Atomically claim one pending job.
 
+    Jobs are selected using:
+    1. Highest priority first
+    2. Oldest job first when priorities are equal
+    3. next_run_at must be due
+
     FOR UPDATE SKIP LOCKED allows multiple workers
-    to safely work on different jobs concurrently.
+    to safely process different jobs concurrently.
     """
 
     with engine.begin() as db:
@@ -32,10 +39,16 @@ def claim_job():
                     name,
                     command,
                     attempts,
-                    max_retries
+                    max_retries,
+                    priority,
+                    next_run_at
                 FROM jobs
                 WHERE status = 'pending'
-                ORDER BY id
+                  AND (
+                      next_run_at IS NULL
+                      OR next_run_at <= CURRENT_TIMESTAMP
+                  )
+                ORDER BY priority DESC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
                 """
@@ -54,6 +67,7 @@ def claim_job():
                 SET
                     status = 'running',
                     attempts = attempts + 1,
+                    next_run_at = NULL,
                     last_error = NULL
                 WHERE id = :id
                 """
@@ -160,12 +174,32 @@ def execute_job(job):
             # max_retries + 1.
             if job["attempts"] <= job["max_retries"]:
 
+                # Exponential backoff:
+                #
+                # attempt 1 → 5 seconds
+                # attempt 2 → 10 seconds
+                # attempt 3 → 20 seconds
+                # attempt 4 → 40 seconds
+                #
+                # Maximum delay is capped at 60 seconds.
+
+                retry_delay = min(
+                    5 * (2 ** (job["attempts"] - 1)),
+                    60,
+                )
+
+                next_run_at = (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(seconds=retry_delay)
+                )
+
                 db.execute(
                     text(
                         """
                         UPDATE jobs
                         SET
                             status = 'pending',
+                            next_run_at = :next_run_at,
                             last_error = :error
                         WHERE id = :id
                         """
@@ -173,6 +207,7 @@ def execute_job(job):
                     {
                         "id": job["id"],
                         "error": error_message,
+                        "next_run_at": next_run_at,
                     },
                 )
 
@@ -182,6 +217,10 @@ def execute_job(job):
                     f"of {job['max_retries'] + 1})"
                 )
 
+                print(
+                    f"[WORKER] Retry scheduled in "
+                    f"{retry_delay} seconds"
+                )
             else:
 
                 db.execute(
@@ -190,6 +229,7 @@ def execute_job(job):
                         UPDATE jobs
                         SET
                             status = 'failed',
+                            next_run_at = NULL,
                             last_error = :error
                         WHERE id = :id
                         """
