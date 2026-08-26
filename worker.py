@@ -4,15 +4,15 @@ import subprocess
 import threading
 import time
 
+from dotenv import load_dotenv
+
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine, text
 
+load_dotenv()
 
-DATABASE_URL = (
-    "postgresql+psycopg://"
-    "scheduler:scheduler_password@localhost:5432/scheduler_db"
-)
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 engine = create_engine(
     DATABASE_URL,
