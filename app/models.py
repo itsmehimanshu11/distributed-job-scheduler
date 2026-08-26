@@ -6,6 +6,33 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
 
+class Worker(Base):
+    __tablename__ = "workers"
+
+    worker_id: Mapped[str] = mapped_column(
+        String(100),
+        primary_key=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="active",
+        nullable=False,
+    )
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    last_heartbeat: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -55,6 +82,18 @@ class Job(Base):
 
     last_error: Mapped[str | None] = mapped_column(
         Text,
+        nullable=True,
+    )
+
+    # Worker currently executing this job.
+    worker_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+
+    # When the current worker claimed the job.
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
         nullable=True,
     )
 
