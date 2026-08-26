@@ -12,6 +12,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      DATABASE_URL: postgresql+psycopg://scheduler:scheduler_password@localhost:5432/scheduler_db
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
