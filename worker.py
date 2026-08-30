@@ -5,14 +5,16 @@ import threading
 import time
 
 from dotenv import load_dotenv
-
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine, text
 
+
 load_dotenv()
 
+
 DATABASE_URL = os.environ["DATABASE_URL"]
+
 
 engine = create_engine(
     DATABASE_URL,
@@ -28,8 +30,10 @@ AGING_INTERVAL_SECONDS = 10
 MAX_AGING_BONUS = 100
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
+
 HEARTBEAT_INTERVAL_SECONDS = 5
 STALE_WORKER_TIMEOUT_SECONDS = 15
+
 
 # ============================================================
 # Worker registration
@@ -65,7 +69,10 @@ def register_worker():
             },
         )
 
-    print(f"[WORKER] Registered worker: {WORKER_ID}")
+    print(
+        f"[WORKER] Registered worker: {WORKER_ID}",
+        flush=True,
+    )
 
 
 # ============================================================
@@ -97,20 +104,22 @@ def heartbeat_loop():
 
         except Exception as exc:
 
-            print(f"[WORKER] Heartbeat error: {exc}")
+            print(
+                f"[WORKER] Heartbeat error: {exc}",
+                flush=True,
+            )
 
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
+
 # ============================================================
-# recover stale jobs
+# Recover stale jobs
 # ============================================================
 
 def recover_stale_jobs():
     """
-    Recover jobs whose assigned worker has stopped sending heartbeats.
-
-    A worker is considered stale when its last heartbeat is older than
-    STALE_WORKER_TIMEOUT_SECONDS.
+    Recover jobs whose assigned worker has stopped
+    sending heartbeats.
     """
 
     with engine.begin() as db:
@@ -132,7 +141,10 @@ def recover_stale_jobs():
                             w.last_heartbeat IS NULL
                             OR w.last_heartbeat <
                                 CURRENT_TIMESTAMP
-                                - (:stale_timeout * INTERVAL '1 second')
+                                - (
+                                    :stale_timeout
+                                    * INTERVAL '1 second'
+                                )
                         )
                     FOR UPDATE OF j SKIP LOCKED
                 )
@@ -160,13 +172,17 @@ def recover_stale_jobs():
         recovered_jobs = result.mappings().all()
 
         for job in recovered_jobs:
+
             print(
                 f"[WORKER] Recovered stale job "
-                f"id={job['id']} name={job['name']} "
-                f"from worker={job['old_worker_id']}"
+                f"id={job['id']} "
+                f"name={job['name']} "
+                f"from worker={job['old_worker_id']}",
+                flush=True,
             )
 
         return len(recovered_jobs)
+
 
 # ============================================================
 # Claim job
@@ -178,15 +194,17 @@ def claim_job():
 
     Scheduling policy:
 
-    1. Calculate aging bonus from how long the job has waited.
+    1. Aging bonus based on waiting time.
     2. effective_priority = priority + aging bonus.
     3. Highest effective priority wins.
-    4. Older jobs win when effective priorities are equal.
+    4. Older jobs win when priorities are equal.
     5. next_run_at must be due.
     6. FOR UPDATE SKIP LOCKED allows multiple workers
-       to safely claim different jobs concurrently.
+       to safely claim different jobs.
     """
+
     recover_stale_jobs()
+
     with engine.begin() as db:
 
         result = db.execute(
@@ -257,6 +275,7 @@ def claim_job():
             return None
 
         # Mark job as running and increment attempt count
+
         db.execute(
             text(
                 """
@@ -280,6 +299,7 @@ def claim_job():
         job = dict(job)
 
         # Keep local copy consistent with database
+
         job["attempts"] += 1
 
         return job
@@ -292,27 +312,35 @@ def claim_job():
 def execute_job(job):
 
     print(
-        f"[WORKER] Executing job "
-        f"id={job['id']} name={job['name']}"
+        f"[WORKER] Worker={WORKER_ID} "
+        f"Executing job id={job['id']} "
+        f"name={job['name']}",
+        flush=True,
     )
 
     print(
-        f"[WORKER] Command: {job['command']}"
+        f"[WORKER] Command: {job['command']}",
+        flush=True,
+    )
+
+    effective_priority = (
+        job["priority"]
+        + min(job["aging_bonus"], MAX_AGING_BONUS)
     )
 
     print(
         f"[WORKER] Priority: {job['priority']} | "
         f"Aging bonus: {job['aging_bonus']} | "
-        f"Effective priority: "
-        f"{job['priority'] + min(job['aging_bonus'], MAX_AGING_BONUS)}"
+        f"Effective priority: {effective_priority}",
+        flush=True,
     )
 
     status = "failed"
     error_message = None
 
-    # --------------------------------------------------------
+    # ========================================================
     # Execute command
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
@@ -329,14 +357,17 @@ def execute_job(job):
             status = "completed"
 
             print(
-                f"[WORKER] Job {job['id']} completed"
+                f"[WORKER] Worker={WORKER_ID} "
+                f"Job {job['id']} completed",
+                flush=True,
             )
 
             if result.stdout:
 
                 print(
                     f"[WORKER] Output: "
-                    f"{result.stdout.strip()}"
+                    f"{result.stdout.strip()}",
+                    flush=True,
                 )
 
         else:
@@ -348,23 +379,25 @@ def execute_job(job):
             )
 
             print(
-                f"[WORKER] Job {job['id']} failed "
-                f"with exit code {result.returncode}"
+                f"[WORKER] Worker={WORKER_ID} "
+                f"Job {job['id']} FAILED "
+                f"with exit code {result.returncode}",
+                flush=True,
             )
 
-            if result.stderr:
-
-                print(
-                    f"[WORKER] Error: "
-                    f"{result.stderr.strip()}"
-                )
+            print(
+                f"[WORKER] Failure reason: {error_message}",
+                flush=True,
+            )
 
     except subprocess.TimeoutExpired:
 
         error_message = "Job timed out after 300 seconds"
 
         print(
-            f"[WORKER] Job {job['id']} timed out"
+            f"[WORKER] Worker={WORKER_ID} "
+            f"Job {job['id']} FAILED: timeout",
+            flush=True,
         )
 
     except Exception as exc:
@@ -372,12 +405,14 @@ def execute_job(job):
         error_message = str(exc)
 
         print(
-            f"[WORKER] Job {job['id']} error: {exc}"
+            f"[WORKER] Worker={WORKER_ID} "
+            f"Job {job['id']} FAILED with error: {exc}",
+            flush=True,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Update database
-    # --------------------------------------------------------
+    # ========================================================
 
     with engine.begin() as db:
 
@@ -405,7 +440,8 @@ def execute_job(job):
 
             print(
                 f"[WORKER] Job {job['id']} "
-                f"marked as completed in database"
+                f"marked as COMPLETED in database",
+                flush=True,
             )
 
         # ====================================================
@@ -416,9 +452,7 @@ def execute_job(job):
 
             # max_retries means retries AFTER the first attempt.
             #
-            # Example:
-            #
-            # max_retries = 3
+            # max_retries = 3:
             #
             # Attempt 1 -> retry
             # Attempt 2 -> retry
@@ -427,16 +461,9 @@ def execute_job(job):
 
             if job["attempts"] <= job["max_retries"]:
 
-                # ------------------------------------------------
-                # Exponential backoff
-                #
-                # Attempt 1 -> 5 seconds
-                # Attempt 2 -> 10 seconds
-                # Attempt 3 -> 20 seconds
-                # Attempt 4 -> 40 seconds
-                #
-                # Maximum delay = 60 seconds
-                # ------------------------------------------------
+                # ============================================
+                # RETRY WITH EXPONENTIAL BACKOFF
+                # ============================================
 
                 retry_delay = min(
                     5 * (2 ** (job["attempts"] - 1)),
@@ -454,6 +481,8 @@ def execute_job(job):
                         UPDATE jobs
                         SET
                             status = 'pending',
+                            worker_id = NULL,
+                            claimed_at = NULL,
                             next_run_at = :next_run_at,
                             last_error = :error
                         WHERE id = :id
@@ -467,19 +496,27 @@ def execute_job(job):
                 )
 
                 print(
-                    f"[WORKER] Job {job['id']} will be retried "
-                    f"(attempt {job['attempts']} "
-                    f"of {job['max_retries'] + 1})"
+                    f"[WORKER] Job {job['id']} "
+                    f"will be RETRIED",
+                    flush=True,
+                )
+
+                print(
+                    f"[WORKER] Attempt "
+                    f"{job['attempts']} "
+                    f"of {job['max_retries'] + 1}",
+                    flush=True,
                 )
 
                 print(
                     f"[WORKER] Retry scheduled in "
-                    f"{retry_delay} seconds"
+                    f"{retry_delay} seconds",
+                    flush=True,
                 )
 
-            # ====================================================
+            # ================================================
             # PERMANENT FAILURE
-            # ====================================================
+            # ================================================
 
             else:
 
@@ -501,8 +538,22 @@ def execute_job(job):
                 )
 
                 print(
-                    f"[WORKER] Job {job['id']} permanently failed "
-                    f"after {job['attempts']} attempts"
+                    f"[WORKER] Worker={WORKER_ID} "
+                    f"Job {job['id']} "
+                    f"PERMANENTLY FAILED",
+                    flush=True,
+                )
+
+                print(
+                    f"[WORKER] Job {job['id']} "
+                    f"failed after {job['attempts']} attempts",
+                    flush=True,
+                )
+
+                print(
+                    f"[WORKER] Final error: "
+                    f"{error_message}",
+                    flush=True,
                 )
 
 
@@ -521,20 +572,38 @@ def worker_loop():
 
     heartbeat_thread.start()
 
-    print("[WORKER] Worker started")
-    print("[WORKER] Waiting for pending jobs...")
+    print(
+        f"[WORKER] Worker started: {WORKER_ID}",
+        flush=True,
+    )
+
+    print(
+        "[WORKER] Waiting for pending jobs...",
+        flush=True,
+    )
 
     while True:
 
-        job = claim_job()
+        try:
 
-        if job is None:
+            job = claim_job()
+
+            if job is None:
+
+                time.sleep(2)
+
+                continue
+
+            execute_job(job)
+
+        except Exception as exc:
+
+            print(
+                f"[WORKER] Worker loop error: {exc}",
+                flush=True,
+            )
 
             time.sleep(2)
-
-            continue
-
-        execute_job(job)
 
 
 # ============================================================

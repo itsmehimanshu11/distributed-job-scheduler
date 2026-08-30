@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Job Scheduler</title>
+    <link rel="stylesheet" href="/frontend/style.css">
+</head>
+
+<body>
+
+<div class="shell">
+
+    <!-- =====================================================
+         TOPBAR
+    ====================================================== -->
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark"></span>
+            <span class="brand-name">Distributed Job Scheduler</span>
+        </div>
+        <div class="connection">
+            <span id="connectionDot" class="connection-dot"></span>
+            <span id="connectionText">Connecting</span>
+        </div>
+    </header>
+
+    <!-- =====================================================
+         STAT STRIP
+    ====================================================== -->
+    <section class="stat-strip">
+        <div class="stat-cell">
+            <div class="stat-label">Total jobs</div>
+            <div class="stat-value" id="totalJobs">0</div>
+        </div>
+        <div class="stat-cell">
+            <div class="stat-label">Pending</div>
+            <div class="stat-value stat-pending" id="pendingJobs">0</div>
+        </div>
+        <div class="stat-cell">
+            <div class="stat-label">Running</div>
+            <div class="stat-value stat-running" id="runningJobs">0</div>
+        </div>
+        <div class="stat-cell">
+            <div class="stat-label">Completed</div>
+            <div class="stat-value stat-completed" id="completedJobs">0</div>
+        </div>
+        <div class="stat-cell">
+            <div class="stat-label">Failed</div>
+            <div class="stat-value stat-failed" id="failedJobs">0</div>
+        </div>
+    </section>
+
+    <!-- =====================================================
+         THROUGHPUT
+    ====================================================== -->
+    <section class="throughput">
+        <div class="throughput-header">
+            <span>Throughput · last 30 min</span>
+            <span id="throughputAvg" class="throughput-avg">0 jobs/min avg</span>
+        </div>
+        <svg id="throughputSvg" viewBox="0 0 760 60" class="throughput-svg" preserveAspectRatio="none">
+            <polyline id="throughputLine" points="" fill="none" stroke="#6C5CE7" stroke-width="1.5"></polyline>
+            <polygon id="throughputFill" points="" fill="#6C5CE7" opacity="0.08"></polygon>
+        </svg>
+    </section>
+
+    <!-- =====================================================
+         DISPATCH + CAPACITY
+    ====================================================== -->
+    <section class="main-row">
+
+        <!-- DISPATCH -->
+        <div class="panel dispatch-panel">
+            <div class="panel-head">
+                <span class="panel-title">Dispatch a job</span>
+                <div class="mode-toggle">
+                    <button type="button" class="mode-btn active" id="modeSingleBtn" data-mode="single">Single</button>
+                    <button type="button" class="mode-btn" id="modeBulkBtn" data-mode="bulk">Bulk</button>
+                </div>
+            </div>
+
+            <form id="jobForm">
+
+                <!-- SINGLE MODE -->
+                <div id="singleFields">
+
+                    <div class="field-row">
+                        <div class="field">
+                            <label for="jobName">Name prefix</label>
+                            <input id="jobName" type="text" value="DISTRIBUTED-JOB" required>
+                        </div>
+                        <div class="field field-narrow">
+                            <label for="jobCount">Count</label>
+                            <input id="jobCount" type="number" min="1" max="500" value="1" required>
+                        </div>
+                    </div>
+
+                    <div class="quick-counts">
+                        <button type="button" data-count="1">1</button>
+                        <button type="button" data-count="10">10</button>
+                        <button type="button" data-count="50">50</button>
+                        <button type="button" data-count="100">100</button>
+                        <button type="button" data-count="500">500</button>
+                    </div>
+
+                    <div class="field">
+                        <label for="jobType">Job type</label>
+                        <select id="jobType">
+                            <option value="echo worker job" data-name="ECHO">Echo — instant, always succeeds</option>
+                            <option value='python -c "import time; time.sleep(2)"' data-name="QUICK-2S">Quick — 2s sleep</option>
+                            <option value='python -c "import time; time.sleep(5)"' data-name="STANDARD-5S">Standard — 5s sleep</option>
+                            <option value='python -c "import time; time.sleep(30)"' data-name="LONG-30S">Long running — 30s sleep</option>
+                            <option value='python -c "import random,time; time.sleep(random.randint(1,10))"' data-name="RANDOM-DURATION">Random duration — 1–10s</option>
+                            <option value='python -c "import sys; sys.exit(1)"' data-name="ALWAYS-FAIL">Always fails — exit 1</option>
+                            <option value='python -c "import random,sys; sys.exit(random.choice([0,1]))"' data-name="FLAKY">Flaky — 50% fail rate</option>
+                            <option value='python -c "sum(i*i for i in range(10**7))"' data-name="CPU-BURN">CPU burn — tight loop</option>
+                            <option value='python -c "[print(i) for i in range(500)]"' data-name="LARGE-OUTPUT">Large output — 500 lines</option>
+                            <option value="custom">Custom command…</option>
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label for="command">Command</label>
+                        <textarea id="command" rows="3" required>echo worker job</textarea>
+                    </div>
+
+                    <div class="field-row">
+                        <div class="field">
+                            <label for="priority">Priority</label>
+                            <input id="priority" type="number" value="100" min="0" max="1000">
+                        </div>
+                        <div class="field">
+                            <label for="maxRetries">Max retries</label>
+                            <input id="maxRetries" type="number" value="3" min="0" max="20">
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- BULK MODE -->
+                <div id="bulkFields" class="hidden">
+                    <div class="field">
+                        <label for="bulkInput">Jobs — one per line</label>
+                        <textarea id="bulkInput" rows="10" placeholder="name,command,priority,max_retries&#10;REPORT-1,echo hello,100,3&#10;REPORT-2,python -c &quot;import time; time.sleep(5)&quot;&#10;python -c &quot;import sys; sys.exit(1)&quot;"></textarea>
+                        <small>
+                            Format: <code>name,command,priority,max_retries</code> — trailing fields optional.
+                            A bare command with no commas gets an auto-numbered name and default priority/retries.
+                        </small>
+                    </div>
+                </div>
+
+                <div class="dispatch-actions">
+                    <button id="createButton" class="btn-primary" type="submit">Create jobs</button>
+                    <button id="clearButton" class="btn-ghost" type="button">Clear</button>
+                </div>
+
+            </form>
+
+            <div id="creationProgress" class="progress hidden">
+                <div class="progress-head">
+                    <span id="progressText">Creating jobs…</span>
+                    <span id="progressPercent">0%</span>
+                </div>
+                <div class="progress-track">
+                    <div id="progressFill" class="progress-fill"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CAPACITY -->
+        <div class="panel capacity-panel">
+            <div class="panel-head">
+                <span class="panel-title">Cluster capacity</span>
+                <span class="live-pill"><span class="live-dot"></span>Live</span>
+            </div>
+
+            <div class="capacity-control">
+                <button type="button" class="step-btn" id="workerMinus" aria-label="Decrease workers">−</button>
+                <input type="number" id="desiredWorkerCount" class="capacity-input" min="1" max="32" value="1" inputmode="numeric">
+                <button type="button" class="step-btn" id="workerPlus" aria-label="Increase workers">+</button>
+            </div>
+            <div class="capacity-caption">workers</div>
+
+            <button type="button" class="btn-outline btn-block" id="applyWorkers">Apply</button>
+
+            <div class="capacity-presets">
+                <button type="button" data-workers="1">1</button>
+                <button type="button" data-workers="2">2</button>
+                <button type="button" data-workers="4">4</button>
+                <button type="button" data-workers="8">8</button>
+                <button type="button" data-workers="16">16</button>
+                <button type="button" data-workers="32">32</button>
+            </div>
+
+            <div id="workerScalingCard" class="capacity-status-wrap">
+                <div id="workerScalingStatus" class="capacity-status">
+                    <span class="status-dot"></span>
+                    <span>Reading current worker count…</span>
+                </div>
+            </div>
+        </div>
+
+    </section>
+
+    <!-- =====================================================
+         WORKER FLEET
+    ====================================================== -->
+    <section class="panel fleet-panel">
+        <div class="panel-head">
+            <span class="panel-title">Worker fleet</span>
+            <div class="fleet-actions">
+                <label class="select-all-label">
+                    <input type="checkbox" id="selectAllWorkers">
+                    Select all
+                </label>
+                <button type="button" id="deleteSelectedWorkersButton" class="btn-danger-outline" disabled>
+                    Delete selected (<span id="selectedWorkerCount">0</span>)
+                </button>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+            <table class="dense-table">
+                <thead>
+                    <tr>
+                        <th class="col-check"></th>
+                        <th>Container</th>
+                        <th>Status</th>
+                        <th class="col-num">Jobs</th>
+                        <th class="col-num">Success</th>
+                    </tr>
+                </thead>
+                <tbody id="fleetTable">
+                    <tr><td colspan="5" class="empty-cell">Loading workers…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- =====================================================
+         JOB QUEUE
+    ====================================================== -->
+    <section class="panel jobs-panel">
+        <div class="panel-head">
+            <span class="panel-title">Job queue</span>
+            <div class="jobs-toolbar">
+                <input id="searchInput" type="text" placeholder="Search jobs…">
+                <select id="statusFilter">
+                    <option value="all">All statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="running">Running</option>
+                    <option value="completed">Completed</option>
+                    <option value="failed">Failed</option>
+                </select>
+                <button type="button" id="refreshButton" class="btn-ghost">Refresh</button>
+                <button type="button" id="clearAllJobsButton" class="btn-danger-outline">Clear all</button>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+            <table class="dense-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Job</th>
+                        <th>Status</th>
+                        <th class="col-num">Prio</th>
+                        <th class="col-num">Attempts</th>
+                        <th>Worker</th>
+                        <th>Created</th>
+                    </tr>
+                </thead>
+                <tbody id="jobsTable">
+                    <tr><td colspan="7" class="empty-cell">Loading jobs…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <span>Distributed Job Scheduler</span>
+        <span>FastAPI · PostgreSQL · Docker</span>
+    </footer>
+
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/frontend/app.js" defer></script>
+
+</body>
+</html>
