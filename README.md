@@ -491,7 +491,7 @@ Ideas for future improvement (not yet implemented):
 
 ## License
 
-*(Add your license here — e.g. MIT, or "All rights reserved" if private.)*
+This project is licensed under the [MIT License](LICENSE).
 
 ## Author
 
