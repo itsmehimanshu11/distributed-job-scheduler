@@ -1,1355 +1,498 @@
-# Distributed Job Scheduler
+# ⚡ Distributed Job Scheduler
 
-A distributed background job scheduling system built with **Python, FastAPI, PostgreSQL, Docker, and multiple worker processes**.
+A distributed background job scheduling system with **live worker fleet control**, built with **Python, FastAPI, PostgreSQL, Docker, and a real-time web dashboard**.
 
-The system allows clients to create background jobs through a REST API. Jobs are stored in PostgreSQL and are independently claimed and executed by workers. Multiple workers can run simultaneously, allowing jobs to be distributed across workers.
+You submit jobs (shell commands) through a REST API or the dashboard. Jobs are stored in PostgreSQL and picked up by one or more **worker containers**, which claim, execute, and report on them. You can scale the number of workers up or down live from the dashboard — Docker containers are created or removed on demand, and any job that was mid-execution on a removed worker is automatically requeued onto a surviving worker instead of getting lost.
+
+![Status](https://img.shields.io/badge/status-active-brightgreen)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
+![Docker](https://img.shields.io/badge/docker-required-2496ED)
+
+---
+
+## Table of contents
+
+- [What this project does](#what-this-project-does)
+- [Screenshot](#screenshot)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [Project structure](#project-structure)
+- [Requirements](#requirements)
+- [Quick start (Docker — recommended)](#quick-start-docker--recommended)
+- [Manual setup (without Docker)](#manual-setup-without-docker)
+- [Using the dashboard](#using-the-dashboard)
+- [API reference](#api-reference)
+- [Environment variables](#environment-variables)
+- [Running tests](#running-tests)
+- [Continuous integration](#continuous-integration)
+- [Troubleshooting](#troubleshooting)
+- [Design notes](#design-notes)
+- [Roadmap](#roadmap)
+
+---
+
+## What this project does
+
+Think of it as a tiny, self-hosted version of a task queue like Celery or Sidekiq, but built from scratch to understand how distributed job scheduling actually works under the hood:
+
+1. You create a **job** — a name plus a shell command to run (e.g. `echo hello`, or a Python script).
+2. The job is stored in **PostgreSQL** with status `pending`.
+3. One or more **worker processes** (each running in its own Docker container) continuously poll the database for pending jobs.
+4. A worker **atomically claims** a job (so two workers never run the same job at once), executes the command, and writes the result back.
+5. Failed jobs are automatically **retried with backoff**, up to a configurable limit.
+6. From the **dashboard**, you can scale the number of workers up or down at any time. If a worker is removed while it's actively running a job, that job is safely **freed and picked up by a remaining worker** instead of being lost.
+
+---
+
+## Screenshot
+
+*(Add a screenshot of your dashboard here once deployed — e.g. drag an image into this section on GitHub, or reference `docs/dashboard.png`.)*
+
+```
+![Dashboard screenshot](docs/dashboard.png)
+```
+
+---
+
+## Architecture
+
+```
+                         ┌────────────────────┐
+                         │   Web Dashboard     │
+                         │ (HTML/CSS/JS)       │
+                         └──────────┬──────────┘
+                                    │ REST + polling
+                                    ▼
+                         ┌────────────────────┐
+                         │     FastAPI API     │
+                         │  (app/main.py)      │
+                         └──────────┬──────────┘
+                                    │
+                 ┌──────────────────┼───────────────────┐
+                 ▼                  ▼                    ▼
+        ┌────────────────┐ ┌───────────────┐   ┌──────────────────┐
+        │   PostgreSQL    │ │ Docker Engine │   │   Job Table       │
+        │  (job + worker  │ │ (via socket)  │   │  pending/running/ │
+        │   state)        │ │ scale workers │   │  completed/failed │
+        └───────┬─────────┘ └───────┬───────┘   └──────────────────┘
+                │                   │
+                │           creates/removes
+                │                   ▼
+                │        ┌─────────────────────┐
+                └───────►│  Worker Container 1  │
+                │        ├─────────────────────┤
+                └───────►│  Worker Container 2  │
+                │        ├─────────────────────┤
+                └───────►│  Worker Container N  │
+                         └─────────────────────┘
+```
+
+- The **API never executes jobs itself** — it only manages state and tells Docker to create/remove worker containers.
+- **Workers are disposable.** Scaling down (or deleting a worker from the dashboard) stops and removes its container. Any job that was actively running on it is reset to `pending` so another worker can finish it — nothing gets silently lost.
+- The **database is the coordination point** between workers, using an atomic "claim" operation so two workers can never grab the same pending job.
 
 ---
 
 ## Features
 
-- REST API using FastAPI
-- PostgreSQL-backed persistent job storage
-- Distributed job execution
-- Multiple workers
-- Atomic job claiming
-- Job priorities
-- Priority aging
-- Automatic retries
-- Exponential retry delays
-- Maximum retry limits
-- Failed-job tracking
-- Worker identification
-- Stale-job recovery / failover
-- Job status tracking
-- Job creation and deletion through API
-- Swagger/OpenAPI documentation
-- Docker-based PostgreSQL environment
-- Worker load distribution
-- Persistent job state in PostgreSQL
+- 🖥️ **Web dashboard** — create jobs, watch the queue live, scale workers, see per-worker stats, all without touching the terminal
+- 📦 **Bulk job creation** — paste many jobs at once (`name,command,priority,max_retries`, one per line)
+- 🧪 **Built-in job type presets** — echo, timed sleeps, random duration, always-fail, flaky (50%), CPU burn, large output — useful for testing the scheduler itself
+- 🐳 **Dynamic worker scaling** — spin Docker worker containers up or down live from the dashboard or via API (1–32 workers)
+- 🔁 **Requeue-safe worker deletion** — deleting/scaling down a worker mid-job frees that job instead of stranding it
+- ⚖️ **Job priority + priority aging** — higher-priority jobs run first; long-waiting jobs get a priority boost over time
+- ♻️ **Automatic retries with backoff** — failed jobs retry with increasing delay, up to `max_retries`
+- 🩺 **Stale job recovery / failover** — if a worker dies mid-job without cleanup, another worker can pick the job back up
+- 🔑 **API key authentication** on all write endpoints
+- 📊 **REST API** with full OpenAPI/Swagger docs at `/docs`
+- ✅ **Automated tests** (pytest) with CI running on every push via GitHub Actions
 
 ---
 
-# Architecture
+## Tech stack
 
-```text
-                    Client
-                      |
-                      v
-              +---------------+
-              |   FastAPI API |
-              +-------+-------+
-                      |
-                      v
-              +---------------+
-              |  PostgreSQL   |
-              |   Job Queue   |
-              +-------+-------+
-                      |
-          +-----------+-----------+
-          |                       |
-          v                       v
-   +-------------+         +-------------+
-   |   Worker 1  |         |   Worker 2  |
-   +-------------+         +-------------+
-          |                       |
-          +-----------+-----------+
-                      |
-                      v
-                Job Execution
-```
-
-The API does not execute jobs itself.
-
-Instead:
-
-1. The API creates a job.
-2. PostgreSQL stores the job.
-3. Workers continuously poll for pending jobs.
-4. A worker atomically claims a job.
-5. The worker executes the command.
-6. The worker updates the job status.
-7. Failed jobs can be retried.
-8. Stale jobs can be recovered by another worker.
-
----
-
-# Technology Stack
-
-| Technology | Purpose |
+| Layer | Technology |
 |---|---|
-| Python | Core application and workers |
-| FastAPI | REST API |
-| Uvicorn | ASGI server |
-| PostgreSQL | Persistent job database |
-| Docker | Database/container environment |
-| SQL | Job storage and atomic scheduling |
-| Swagger/OpenAPI | API testing and documentation |
-| PowerShell | Windows development commands |
+| API | Python 3.12, FastAPI, Uvicorn |
+| Database | PostgreSQL 16 |
+| ORM | SQLAlchemy 2.0 |
+| Worker orchestration | Docker SDK for Python |
+| Frontend | Vanilla HTML/CSS/JavaScript (no build step) |
+| Containerization | Docker, Docker Compose |
+| Testing | pytest |
+| CI | GitHub Actions |
 
 ---
 
-# Project Structure
+## Project structure
 
-```text
+```
 Distributed Job Scheduler/
 │
 ├── app/
 │   ├── __init__.py
-│   ├── database.py
-│   ├── main.py
-│   └── models.py
+│   ├── main.py              # FastAPI app: all REST endpoints
+│   ├── database.py           # DB engine/session setup
+│   └── models.py             # SQLAlchemy models (Job, Worker)
 │
-├── worker.py
-├── migrate_worker.py
-├── docker-compose.yml
-├── README.md
-├── .gitignore
+├── frontend/
+│   ├── index.html            # Dashboard markup
+│   ├── style.css             # Dashboard styling
+│   └── app.js                # Dashboard logic (polling, forms, tables)
 │
-└── venv/
+├── tests/
+│   ├── test_auth.py          # API key auth tests
+│   └── test_worker.py        # Worker logic tests
+│
+├── .github/workflows/
+│   └── tests.yml             # CI: runs pytest against a real Postgres service
+│
+├── worker.py                  # The worker process (runs inside each container)
+├── migrate_worker_schema.py   # One-off DB migration helper for the workers table
+├── docker-compose.yml         # Defines api, db, and worker services
+├── Dockerfile                 # Shared image for both api and worker
+├── requirements.txt
+├── .env.example                # Template for your local .env
+└── README.md
 ```
-
-### Important files
-
-### `app/main.py`
-
-Contains the FastAPI application and REST API endpoints.
-
-### `app/database.py`
-
-Handles PostgreSQL database connectivity.
-
-### `app/models.py`
-
-Contains the database/job models and related structures.
-
-### `worker.py`
-
-Contains the worker process responsible for:
-
-- registering the worker
-- polling for jobs
-- claiming jobs
-- executing commands
-- handling failures
-- retrying failed jobs
-- recovering stale jobs
-- updating job status
-
-### `migrate_worker.py`
-
-Used for worker-related database migration/setup.
-
-### `docker-compose.yml`
-
-Used to start PostgreSQL through Docker.
 
 ---
 
-# Requirements
+## Requirements
 
-Install the following:
+You only need **one** of the two setups below.
 
-- Python 3.12+
-- Docker Desktop
+### Docker setup (recommended — easiest)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
 - Git
-- PowerShell on Windows
+
+### Manual setup (no Docker)
+- Python 3.12+
+- PostgreSQL running locally (or via Docker just for the database)
+- Git
 
 ---
 
-# 1. Clone the Project
+## Quick start (Docker — recommended)
+
+This is the easiest way to run the whole system — API, database, and one worker — with a single command. **Beginner-friendly, step by step:**
+
+### Step 1 — Install Docker Desktop
+
+Download and install it from [docker.com](https://www.docker.com/products/docker-desktop/), then **open Docker Desktop and make sure it's running** (you'll see a whale icon in your system tray/menu bar).
+
+### Step 2 — Clone the project
 
 ```powershell
-git clone <YOUR-GITHUB-REPOSITORY-URL>
-cd "Distributed Job Scheduler"
+git clone https://github.com/itsmehimanshu11/distributed-job-scheduler.git
+cd distributed-job-scheduler
 ```
 
-If you already have the project:
+### Step 3 — Create your environment file
+
+Copy the example file and fill in your own values:
 
 ```powershell
-cd "Distributed Job Scheduler"
+copy .env.example .env
+```
+
+*(On macOS/Linux use `cp .env.example .env` instead.)*
+
+Open the new `.env` file in any text editor and set:
+
+```env
+API_KEY=choose-any-secret-string-you-like
+```
+
+You can leave the database values as-is — Docker Compose uses them automatically.
+
+### Step 4 — Start everything
+
+```powershell
+docker compose up -d --build
+```
+
+This single command:
+- Builds the API and worker Docker images
+- Starts PostgreSQL
+- Starts the API server
+- Starts one worker
+
+Wait about 10–15 seconds for everything to boot, then check that all three containers are running:
+
+```powershell
+docker compose ps
+```
+
+You should see `api`, `db`, and `worker`, all with status `Up` (or `healthy` for the database).
+
+### Step 5 — Open the dashboard
+
+Open your browser and go to:
+
+```
+http://localhost:8000
+```
+
+You now have a live dashboard where you can create jobs, scale workers, and watch everything happen in real time.
+
+### Step 6 — (Optional) Explore the raw API
+
+FastAPI auto-generates interactive API docs. Open:
+
+```
+http://localhost:8000/docs
+```
+
+Here you can test every endpoint directly in the browser.
+
+### Stopping the project
+
+```powershell
+docker compose down
+```
+
+Your data stays saved (in a Docker volume) — running `docker compose up -d` again picks up right where you left off. To wipe the database completely, add `-v`:
+
+```powershell
+docker compose down -v
 ```
 
 ---
 
-# 2. Create Virtual Environment
+## Manual setup (without Docker)
+
+Use this if you want to run the API and worker directly with Python (useful for development/debugging), while still using Docker just for the database.
+
+### 1. Clone the project
+
+```powershell
+git clone https://github.com/itsmehimanshu11/distributed-job-scheduler.git
+cd distributed-job-scheduler
+```
+
+### 2. Create and activate a virtual environment
 
 ```powershell
 python -m venv venv
-```
-
-Activate it:
-
-```powershell
 .\venv\Scripts\Activate.ps1
 ```
 
-If PowerShell blocks activation:
+If PowerShell blocks the activation script:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 .\venv\Scripts\Activate.ps1
 ```
 
-You should then see:
+You should see `(venv)` at the start of your terminal prompt.
 
-```text
-(venv) PS C:\...\Distributed Job Scheduler>
-```
-
----
-
-# 3. Start PostgreSQL
-
-Make sure Docker Desktop is running.
-
-Then execute:
+### 3. Install dependencies
 
 ```powershell
-docker compose up -d
+pip install -r requirements.txt
 ```
 
-Check containers:
+### 4. Set up your `.env` file
 
 ```powershell
-docker compose ps
+copy .env.example .env
 ```
 
-The PostgreSQL container should be running.
+Edit `.env` and set an `API_KEY` of your choice.
 
----
+### 5. Start just the database with Docker
 
-# 4. Start the FastAPI Server
+```powershell
+docker compose up -d db
+```
 
-In a terminal with the virtual environment activated:
+### 6. Start the API
 
 ```powershell
 python -m uvicorn app.main:app --reload
 ```
 
-The API will run at:
+The API is now running at `http://127.0.0.1:8000`.
 
-```text
+### 7. Start a worker (in a new terminal)
+
+```powershell
+.\venv\Scripts\Activate.ps1
+python worker.py
+```
+
+You should see:
+
+```
+[WORKER] Registered worker: YOUR-MACHINE-1234
+[WORKER] Worker started
+[WORKER] Waiting for pending jobs...
+```
+
+You can repeat step 7 in additional terminals to run more workers manually — each one registers with a unique ID and independently claims jobs.
+
+### 8. Open the dashboard
+
+```
 http://127.0.0.1:8000
 ```
 
 ---
 
-# 5. Open Swagger API Documentation
+## Using the dashboard
 
-Open:
+Once the dashboard is open at `http://localhost:8000`:
 
-```text
-http://127.0.0.1:8000/docs
-```
-
-Swagger provides an interactive interface for testing the API.
-
-You can test:
-
-- health check
-- create job
-- list jobs
-- get job
-- delete job
+- **Dispatch a job** — fill in a name, pick a job type (or write a custom command), and click **Create jobs**. Use **Bulk** mode to create several different jobs at once by pasting a list.
+- **Cluster capacity** — use `+`/`−` or a preset button, then click **Apply** to scale the number of live worker containers.
+- **Worker fleet** — see every live worker, how many jobs it's completed, and its current status. Select one or more and click **Delete selected** to remove them (their in-flight jobs are automatically handed off to a remaining worker).
+- **Job queue** — search, filter by status, and watch job status update live every couple of seconds.
 
 ---
 
-# API Endpoints
+## API reference
 
-## GET `/`
+All write endpoints (creating/deleting jobs or workers) require an `X-API-Key` header matching your `.env` value.
 
-Returns the root API response.
+### Jobs
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/jobs` | List all jobs |
+| `POST` | `/jobs` | Create a job |
+| `GET` | `/jobs/{job_id}` | Get one job |
+| `DELETE` | `/jobs/{job_id}` | Delete one job |
+| `DELETE` | `/jobs/all` | Delete every job |
+
+**Create a job:**
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "hello-world",
+        "command": "echo Hello from the scheduler!",
+        "priority": 100,
+        "max_retries": 3
+      }'
+```
+
+### Workers
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/workers` | List currently running worker containers |
+| `POST` | `/workers/scale` | Scale to a target worker count (1–32) |
+| `DELETE` | `/workers/{worker_id}` | Remove one specific worker |
+
+**Scale to 4 workers:**
+
+```bash
+curl -X POST http://localhost:8000/workers/scale \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"workers": 4}'
+```
+
+### System
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Dashboard (HTML) |
+| `GET` | `/health` | Health check |
+| `GET` | `/docs` | Interactive Swagger API docs |
 
 ---
 
-## GET `/health`
+## Environment variables
 
-Checks whether the API is running.
+Copy `.env.example` to `.env` and configure:
 
-Example:
+| Variable | Description | Example |
+|---|---|---|
+| `POSTGRES_USER` | Database username | `scheduler` |
+| `POSTGRES_PASSWORD` | Database password | *(choose your own)* |
+| `POSTGRES_DB` | Database name | `scheduler_db` |
+| `POSTGRES_HOST` | Database host (Docker Compose sets this automatically for containers) | `localhost` |
+| `POSTGRES_PORT` | Database port | `5432` |
+| `DATABASE_URL` | Full SQLAlchemy connection string | `postgresql+psycopg://scheduler:...@localhost:5432/scheduler_db` |
+| `API_KEY` | Secret key required for all write requests | *(choose your own secret)* |
 
-```text
-GET http://127.0.0.1:8000/health
-```
-
----
-
-## GET `/jobs`
-
-Returns the available jobs.
-
-Example:
-
-```text
-GET http://127.0.0.1:8000/jobs
-```
+**Never commit your real `.env` file.** It's already excluded via `.gitignore` — only `.env.example` (with placeholder values) should ever be committed.
 
 ---
 
-## POST `/jobs`
-
-Creates a new job.
-
-Example request:
-
-```json
-{
-  "name": "API_SUCCESS_TEST",
-  "command": "echo API_TEST_SUCCESS",
-  "priority": 100,
-  "max_retries": 3
-}
-```
-
-Example response:
-
-```json
-{
-  "id": 280,
-  "name": "API_SUCCESS_TEST",
-  "command": "echo API_TEST_SUCCESS",
-  "status": "completed",
-  "attempts": 1,
-  "max_retries": 3,
-  "priority": 100,
-  "next_run_at": null,
-  "last_error": null,
-  "created_at": "2026-08-26T09:08:50.625430"
-}
-```
-
----
-
-## GET `/jobs/{job_id}`
-
-Returns a specific job.
-
-Example:
-
-```text
-GET /jobs/280
-```
-
-A successfully completed job returns information such as:
-
-```json
-{
-  "id": 280,
-  "name": "API_SUCCESS_TEST",
-  "command": "echo API_TEST_SUCCESS",
-  "status": "completed",
-  "attempts": 1,
-  "max_retries": 3,
-  "priority": 100,
-  "next_run_at": null,
-  "last_error": null
-}
-```
-
----
-
-## DELETE `/jobs/{job_id}`
-
-Deletes a job.
-
-Example:
-
-```text
-DELETE /jobs/280
-```
-
-Response:
-
-```json
-{
-  "message": "Job deleted",
-  "id": 280
-}
-```
-
-After deletion, requesting the same job returns:
-
-```text
-404 Not Found
-```
-
-with:
-
-```json
-{
-  "detail": "Job not found"
-}
-```
-
----
-
-# 6. Start a Worker
-
-Open another PowerShell terminal.
-
-Navigate to the project:
+## Running tests
 
 ```powershell
-cd "Distributed Job Scheduler"
+python -m pytest -q
 ```
 
-Activate the virtual environment:
+Tests require a reachable PostgreSQL database (matching your `DATABASE_URL`), since the app connects to it on import. If you're running tests locally, make sure `docker compose up -d db` is running first.
 
+---
+
+## Continuous integration
+
+Every push to `main` automatically runs the test suite via **GitHub Actions** (`.github/workflows/tests.yml`). The workflow spins up a temporary PostgreSQL service container so tests run against a real database, exactly like production — no manual setup needed on GitHub's side. Check the **Actions** tab on the repository to see build status.
+
+---
+
+## Troubleshooting
+
+**"Docker Engine unavailable" error from the API**
+Make sure Docker Desktop is actually running before starting the API — worker scaling talks to Docker directly through its socket.
+
+**Dashboard shows "API Offline"**
+Check `docker compose ps` — if the `api` container isn't `Up`, check its logs: `docker compose logs api`.
+
+**Changes to `frontend/` files don't show up in the browser**
+The frontend is baked into the Docker image at build time. After editing `index.html`/`style.css`/`app.js`, rebuild:
 ```powershell
-.\venv\Scripts\Activate.ps1
+docker compose up -d --build
 ```
+Then hard-refresh your browser (`Ctrl+Shift+R`).
 
-Start the worker:
+**Port 8000 or 5432 already in use**
+Something else on your machine is using that port. Either stop it, or change the port mapping in `docker-compose.yml` (e.g. `"8001:8000"`).
 
-```powershell
-python .\worker.py
-```
-
-You should see output similar to:
-
-```text
-[WORKER] Registered worker: HIMANSHU-XXXX
-[WORKER] Worker started
-[WORKER] Waiting for pending jobs...
-```
-
-The worker will continuously wait for jobs.
+**"Cannot delete the last worker" error**
+By design — the system always keeps at least one worker alive so jobs don't get permanently stranded. Scale up first if you need to replace the last remaining worker.
 
 ---
 
-# 7. Run Multiple Workers
+## Design notes
 
-The scheduler supports multiple workers.
-
-Open another terminal:
-
-```powershell
-cd "Distributed Job Scheduler"
-.\venv\Scripts\Activate.ps1
-python .\worker.py
-```
-
-For example:
-
-```text
-Worker 1 -> HIMANSHU-7192
-Worker 2 -> HIMANSHU-9892
-```
-
-Both workers can independently claim and execute jobs.
+- **Atomic job claiming** prevents two workers from ever executing the same pending job — the database transaction guarantees exclusivity.
+- **Requeue-on-delete**: when a worker is removed (via scale-down or explicit delete), the API first stops the container, *then* checks for any job that was actively running on it and resets that job to `pending` before finally removing the container. Stopping before requeuing closes a race condition where the worker could otherwise grab a brand-new job in the gap.
+- **Priority aging** slowly increases the effective priority of jobs that have been waiting a long time, so low-priority jobs don't starve indefinitely behind a constant stream of high-priority ones.
+- **Workers are stateless and disposable** — any worker can be killed and replaced at any time without losing job data, since all state lives in PostgreSQL, not in the worker process.
 
 ---
 
-# Distributed Execution
+## Roadmap
 
-When multiple jobs are submitted, workers compete for pending jobs.
+Ideas for future improvement (not yet implemented):
 
-For example:
-
-```text
-Worker 1
-    |
-    +---- Job 1
-    +---- Job 3
-    +---- Job 5
-    +---- Job 7
-
-Worker 2
-    |
-    +---- Job 2
-    +---- Job 4
-    +---- Job 6
-    +---- Job 8
-```
-
-The database is responsible for coordinating job ownership.
-
-This prevents two workers from normally executing the same pending job simultaneously.
+- Redis-based queueing as an alternative backend
+- WebSocket-based live updates (replacing polling)
+- Job scheduling (cron-style / delayed jobs)
+- Job dependencies / DAGs
+- Dead-letter queue for permanently failed jobs
+- Prometheus metrics + Grafana dashboard
+- Kubernetes deployment manifests
+- Horizontal autoscaling based on queue depth
 
 ---
 
-# Job Lifecycle
+## License
 
-A job can move through states such as:
+*(Add your license here — e.g. MIT, or "All rights reserved" if private.)*
 
-```text
-pending
-   |
-   v
-running
-   |
-   +----------+
-   |          |
-   v          v
-completed   failed
-              |
-              v
-           retry
-              |
-              v
-           pending
-```
+## Author
 
-If the maximum number of attempts is exhausted:
-
-```text
-failed
-```
-
-The job remains permanently failed.
-
----
-
-# Job Priorities
-
-Jobs have a priority value.
-
-Example:
-
-```json
-{
-  "name": "HIGH_PRIORITY_JOB",
-  "command": "echo HIGH",
-  "priority": 100,
-  "max_retries": 3
-}
-```
-
-Higher priority jobs should receive preference when the worker selects pending jobs.
-
-Example priority values:
-
-```text
-PRIORITY_100
-PRIORITY_80
-PRIORITY_50
-PRIORITY_20
-PRIORITY_10
-```
-
-A priority test was performed with five jobs.
-
-The jobs were stored and completed with their priority values visible:
-
-```text
-PRIORITY_FINAL_5    100
-PRIORITY_FINAL_4     80
-PRIORITY_FINAL_3     50
-PRIORITY_FINAL_2     20
-PRIORITY_FINAL_1     10
-```
-
-Worker logs also displayed:
-
-```text
-Priority: 100 | Aging bonus: 0 | Effective priority: 100
-Priority: 80  | Aging bonus: 0 | Effective priority: 80
-Priority: 50  | Aging bonus: 0 | Effective priority: 50
-Priority: 20  | Aging bonus: 0 | Effective priority: 20
-Priority: 10  | Aging bonus: 0 | Effective priority: 10
-```
-
----
-
-# Priority Aging
-
-The scheduler also supports priority aging.
-
-Aging increases the effective priority of jobs that remain waiting.
-
-Conceptually:
-
-```text
-effective_priority
-    =
-base_priority
-    +
-aging_bonus
-```
-
-Example:
-
-```text
-Priority: 100
-Aging bonus: 3
-Effective priority: 103
-```
-
-This helps prevent low-priority jobs from waiting indefinitely.
-
----
-
-# Automatic Retry
-
-Failed jobs can automatically retry.
-
-Example job:
-
-```json
-{
-  "name": "API_RETRY_TEST",
-  "command": "cmd /c exit 1",
-  "priority": 100,
-  "max_retries": 2
-}
-```
-
-The command intentionally fails.
-
-The worker produces output similar to:
-
-```text
-[WORKER] Job 281 failed with exit code 1
-[WORKER] Job 281 will be retried (attempt 1 of 3)
-[WORKER] Retry scheduled in 5 seconds
-
-[WORKER] Job 281 failed with exit code 1
-[WORKER] Job 281 will be retried (attempt 2 of 3)
-[WORKER] Retry scheduled in 10 seconds
-
-[WORKER] Job 281 failed with exit code 1
-[WORKER] Job 281 permanently failed after 3 attempts
-```
-
-The database records:
-
-```text
-status       = failed
-attempts     = 3
-max_retries  = 2
-last_error   = Exit code 1
-```
-
----
-
-# Retry Backoff
-
-Retry delays increase between attempts.
-
-Example:
-
-```text
-Attempt 1
-    |
-    +---- wait 5 seconds
-    |
-Attempt 2
-    |
-    +---- wait 10 seconds
-    |
-Attempt 3
-```
-
-This prevents a continuously failing job from being executed repeatedly without delay.
-
----
-
-# Successful Job Example
-
-A simple successful command:
-
-```json
-{
-  "name": "API_SUCCESS_TEST",
-  "command": "echo API_TEST_SUCCESS",
-  "priority": 100,
-  "max_retries": 3
-}
-```
-
-Worker output:
-
-```text
-[WORKER] Executing job id=280 name=API_SUCCESS_TEST
-[WORKER] Command: echo API_TEST_SUCCESS
-[WORKER] Priority: 100 | Aging bonus: 0 | Effective priority: 100
-[WORKER] Job 280 completed
-[WORKER] Output: API_TEST_SUCCESS
-[WORKER] Job 280 marked as completed in database
-```
-
----
-
-# Stale Job Recovery / Failover
-
-The scheduler supports recovery of jobs that were claimed by a worker but became stale.
-
-For example:
-
-```text
-Worker 1
-   |
-   +---- claims Job 303
-   |
-   +---- worker stops/fails
-             |
-             v
-        stale job detected
-             |
-             v
-Worker 2 claims Job 303
-             |
-             v
-          completed
-```
-
-A failover test was performed where a stale job was recovered by another worker.
-
-The database showed:
-
-```text
-303 | FINAL_FAILOVER_TEST | completed | HIMANSHU-7192 | attempts = 2
-```
-
-The worker log showed:
-
-```text
-[WORKER] Recovered stale job id=303
-[WORKER] Executing job id=303 name=FINAL_FAILOVER_TEST
-[WORKER] Job 303 completed
-```
-
-This demonstrates that a stale claimed job can be recovered and executed by another worker.
-
----
-
-# Worker Distribution Test
-
-The scheduler was also tested with two workers.
-
-A batch of 20 jobs was submitted.
-
-Database verification showed:
-
-```text
-total_jobs | completed_jobs | failed_jobs | workers_used
------------+----------------+-------------+-------------
-20         | 20             | 0           | 2
-```
-
-Worker distribution:
-
-```text
-worker_id       | jobs_completed
-----------------+---------------
-HIMANSHU-7192   | 10
-HIMANSHU-9892   | 10
-```
-
-Therefore:
-
-```text
-20 jobs
-20 completed
-0 failed
-2 workers
-10 jobs per worker
-```
-
-This demonstrates actual distributed job execution across multiple worker processes.
-
----
-
-# Database Verification
-
-PostgreSQL can be accessed through Docker.
-
-Example:
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db
-```
-
-Useful query:
-
-```sql
-SELECT
-    id,
-    name,
-    status,
-    worker_id,
-    attempts,
-    last_error
-FROM jobs
-ORDER BY id DESC;
-```
-
----
-
-# Check Worker Distribution
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db -P pager=off -c "SELECT worker_id, COUNT(*) AS jobs_completed FROM jobs WHERE status='completed' GROUP BY worker_id ORDER BY worker_id;"
-```
-
-Example result:
-
-```text
-worker_id       | jobs_completed
-----------------+---------------
-HIMANSHU-7192   | 10
-HIMANSHU-9892   | 10
-```
-
----
-
-# Check Job Statistics
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db -P pager=off -c "SELECT COUNT(*) AS total_jobs, COUNT(*) FILTER (WHERE status='completed') AS completed_jobs, COUNT(*) FILTER (WHERE status='failed') AS failed_jobs, COUNT(DISTINCT worker_id) AS workers_used FROM jobs;"
-```
-
-Example:
-
-```text
-total_jobs | completed_jobs | failed_jobs | workers_used
------------+----------------+-------------+-------------
-20         | 20             | 0           | 2
-```
-
----
-
-# Check Retry Information
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db -P pager=off -c "SELECT id,name,status,attempts,max_retries,last_error,worker_id FROM jobs ORDER BY id DESC LIMIT 10;"
-```
-
----
-
-# Check a Specific Job
-
-Example:
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db -P pager=off -c "SELECT id,name,status,worker_id,claimed_at,attempts,last_error FROM jobs WHERE id=280;"
-```
-
----
-
-# Testing Through Swagger
-
-Open:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-## Test 1 — Health
-
-Open:
-
-```text
-GET /health
-```
-
-Click:
-
-```text
-Try it out
-```
-
-Then:
-
-```text
-Execute
-```
-
-Expected result:
-
-```text
-200 OK
-```
-
----
-
-## Test 2 — Create Successful Job
-
-Open:
-
-```text
-POST /jobs
-```
-
-Use:
-
-```json
-{
-  "name": "API_SUCCESS_TEST",
-  "command": "echo API_TEST_SUCCESS",
-  "priority": 100,
-  "max_retries": 3
-}
-```
-
-Click:
-
-```text
-Execute
-```
-
-Then check the worker terminal.
-
-Expected:
-
-```text
-Job completed
-Output: API_TEST_SUCCESS
-```
-
----
-
-## Test 3 — List Jobs
-
-Open:
-
-```text
-GET /jobs
-```
-
-Click:
-
-```text
-Execute
-```
-
-The created jobs should appear.
-
----
-
-## Test 4 — Get a Job
-
-Open:
-
-```text
-GET /jobs/{job_id}
-```
-
-Enter a valid job ID:
-
-```text
-280
-```
-
-Click:
-
-```text
-Execute
-```
-
-Expected:
-
-```text
-200 OK
-```
-
----
-
-## Test 5 — Delete a Job
-
-Open:
-
-```text
-DELETE /jobs/{job_id}
-```
-
-Enter:
-
-```text
-280
-```
-
-Click:
-
-```text
-Execute
-```
-
-Expected:
-
-```json
-{
-  "message": "Job deleted",
-  "id": 280
-}
-```
-
-Trying to retrieve the same job afterward should return:
-
-```text
-404 Job not found
-```
-
----
-
-# Testing a Failed Job
-
-Create:
-
-```json
-{
-  "name": "FINAL_RETRY_TEST",
-  "command": "cmd /c exit 1",
-  "priority": 100,
-  "max_retries": 2
-}
-```
-
-The worker should retry the job.
-
-Expected behavior:
-
-```text
-Attempt 1 -> failed
-Attempt 2 -> failed
-Attempt 3 -> failed
-             |
-             v
-       permanently failed
-```
-
----
-
-# Testing Two Workers
-
-Start Worker 1:
-
-```powershell
-python .\worker.py
-```
-
-Start Worker 2 in another terminal:
-
-```powershell
-python .\worker.py
-```
-
-Then create multiple jobs.
-
-Check distribution:
-
-```powershell
-docker exec -it distributedjobscheduler-db-1 psql -U scheduler -d scheduler_db -P pager=off -c "SELECT worker_id, COUNT(*) AS jobs_completed FROM jobs WHERE status='completed' GROUP BY worker_id ORDER BY worker_id;"
-```
-
-Expected:
-
-```text
-Multiple worker IDs
-```
-
-and jobs distributed between them.
-
----
-
-# Important Design Concepts
-
-## Atomic Job Claiming
-
-A worker must safely claim a job so that two workers do not execute the same pending job simultaneously.
-
-The database is used as the coordination point.
-
----
-
-## Worker Registration
-
-Every worker receives a worker identifier.
-
-Example:
-
-```text
-HIMANSHU-7192
-HIMANSHU-9892
-```
-
-The worker ID is associated with claimed jobs.
-
----
-
-## Job Ownership
-
-When a worker claims a job, the job records information about the worker that owns it.
-
-This allows the system to track:
-
-```text
-Which worker claimed the job?
-Which worker executed the job?
-How many jobs did each worker complete?
-```
-
----
-
-## Retry State
-
-Each job tracks:
-
-```text
-attempts
-max_retries
-last_error
-next_run_at
-```
-
-This allows failed jobs to be retried without losing their state.
-
----
-
-# Recommended Startup Order
-
-For a fresh run:
-
-### Terminal 1 — Docker
-
-```powershell
-docker compose up -d
-```
-
-### Terminal 2 — API
-
-```powershell
-.\venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --reload
-```
-
-### Terminal 3 — Worker 1
-
-```powershell
-.\venv\Scripts\Activate.ps1
-python .\worker.py
-```
-
-### Terminal 4 — Worker 2
-
-```powershell
-.\venv\Scripts\Activate.ps1
-python .\worker.py
-```
-
-Then open:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
----
-
-# Stopping the Project
-
-Stop the API and worker terminals with:
-
-```text
-Ctrl + C
-```
-
-Stop Docker services:
-
-```powershell
-docker compose down
-```
-
----
-
-# Useful Docker Commands
-
-Show running containers:
-
-```powershell
-docker ps
-```
-
-Show Compose services:
-
-```powershell
-docker compose ps
-```
-
-View logs:
-
-```powershell
-docker compose logs
-```
-
-Stop services:
-
-```powershell
-docker compose down
-```
-
-Start services again:
-
-```powershell
-docker compose up -d
-```
-
----
-
-# Current Tested Capabilities
-
-The following functionality has been tested during development:
-
-| Feature | Status |
-|---|---|
-| FastAPI server | Tested |
-| Swagger documentation | Tested |
-| Health endpoint | Tested |
-| Create job API | Tested |
-| List jobs API | Tested |
-| Get job API | Tested |
-| Delete job API | Tested |
-| Successful command execution | Tested |
-| Failed command execution | Tested |
-| Automatic retries | Tested |
-| Retry backoff | Tested |
-| Maximum retry handling | Tested |
-| Job priority | Tested |
-| Priority aging | Tested |
-| Worker registration | Tested |
-| Multiple workers | Tested |
-| Distributed job execution | Tested |
-| Worker distribution | Tested |
-| Stale job recovery/failover | Tested |
-| PostgreSQL persistence | Tested |
-
----
-
-# Example End-to-End Flow
-
-```text
-1. Client sends POST /jobs
-             |
-             v
-2. FastAPI validates request
-             |
-             v
-3. Job inserted into PostgreSQL
-             |
-             v
-4. Worker polls database
-             |
-             v
-5. Worker claims job
-             |
-             v
-6. Command executed
-             |
-       +-----+-----+
-       |           |
-    Success      Failure
-       |           |
-       v           v
-  completed      retry
-                   |
-              +----+----+
-              |         |
-          attempts    max attempts
-          remaining    exhausted
-              |         |
-              v         v
-           retry      failed
-```
-
----
-
-# Why This Project Is Distributed
-
-This is not simply a background-task API.
-
-The scheduler supports multiple independent worker processes that share the same PostgreSQL job queue.
-
-For example:
-
-```text
-                 PostgreSQL
-                     |
-          +----------+----------+
-          |                     |
-          v                     v
-      Worker 1              Worker 2
-          |                     |
-       Job A                  Job B
-       Job C                  Job D
-       Job E                  Job F
-```
-
-Workers can be started independently, and jobs are coordinated through the shared database.
-
----
-
-# Future Improvements
-
-Possible future enhancements include:
-
-- Redis-based queueing
-- Worker heartbeat monitoring
-- Worker health dashboard
-- WebSocket live job updates
-- Authentication and authorization
-- Rate limiting
-- Job cancellation
-- Scheduled jobs
-- Cron-style jobs
-- Job dependencies
-- Dead-letter queue
-- Metrics with Prometheus
-- Grafana dashboard
-- Dockerized API and workers
-- Kubernetes deployment
-- Horizontal worker autoscaling
-- Distributed tracing
-- Structured logging
-- CI/CD pipeline
-
-These are **future improvements** and are not currently claimed as implemented features.
-
----
-
-# Project Summary
-
-The Distributed Job Scheduler demonstrates how a background job execution system can be designed using:
-
-```text
-Python
-   +
-FastAPI
-   +
-PostgreSQL
-   +
-Multiple Workers
-   +
-Docker
-```
-
-The system provides:
-
-```text
-REST API
-   |
-Job Persistence
-   |
-Distributed Workers
-   |
-Priority Scheduling
-   |
-Retry Handling
-   |
-Failure Recovery
-   |
-Worker Distribution
-```
-
-The project demonstrates practical concepts in:
-
-- distributed systems
-- backend development
-- database concurrency
-- job queues
-- worker processes
-- fault tolerance
-- retry mechanisms
-- scheduling
-- REST API development
-- PostgreSQL
-- Docker
+Built by [Himanshu](https://github.com/itsmehimanshu11) as a hands-on project exploring distributed systems, background job queues, and container orchestration.
