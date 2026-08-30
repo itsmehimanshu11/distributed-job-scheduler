@@ -12,8 +12,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler_password
+          POSTGRES_DB: scheduler_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scheduler"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       DATABASE_URL: postgresql+psycopg://scheduler:scheduler_password@localhost:5432/scheduler_db
+      API_KEY: test-ci-api-key
 
     steps:
       - name: Checkout repository
@@ -28,6 +44,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432 -U scheduler; do
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+        env:
+          PGPASSWORD: scheduler_password
 
       - name: Run tests
         run: |
