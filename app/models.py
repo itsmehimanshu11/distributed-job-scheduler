@@ -102,3 +102,12 @@ class Job(Base):
         default=datetime.utcnow,
         nullable=False,
     )
+
+    # Optional client-supplied key for idempotent job submission.
+    # If a job with the same dedupe_key already exists, the API
+    # returns the existing job instead of creating a duplicate.
+    dedupe_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )

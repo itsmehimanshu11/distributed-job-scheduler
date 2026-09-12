@@ -1,46 +1,34 @@
-from sqlalchemy import text
+"""
+DEPRECATED: this one-off script is kept only so old deployment
+instructions don't hard-fail. Schema changes are now managed with
+Alembic (see the `alembic/` directory).
 
-from app.database import engine
+To bring an existing database up to date:
+
+    # If the database already has the `workers` table and the
+    # worker_id/claimed_at columns on `jobs` (i.e. you previously
+    # ran this script), tell Alembic it's already at the baseline:
+    alembic stamp 0001_baseline
+
+    # Then apply anything after the baseline (e.g. the dedupe_key
+    # column):
+    alembic upgrade head
+
+For a brand-new database, just run `alembic upgrade head` -- no
+need to stamp anything first.
+"""
+
+import sys
 
 
 def migrate():
-    with engine.begin() as db:
-
-        # Create workers table
-        db.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS workers (
-                    worker_id VARCHAR(100) PRIMARY KEY,
-                    status VARCHAR(50) NOT NULL DEFAULT 'active',
-                    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    last_heartbeat TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-        )
-
-        # Add worker_id to existing jobs table
-        db.execute(
-            text(
-                """
-                ALTER TABLE jobs
-                ADD COLUMN IF NOT EXISTS worker_id VARCHAR(100)
-                """
-            )
-        )
-
-        # Add claimed_at to existing jobs table
-        db.execute(
-            text(
-                """
-                ALTER TABLE jobs
-                ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP
-                """
-            )
-        )
-
-    print("[MIGRATION] Worker schema updated successfully.")
+    print(
+        "[MIGRATION] This script is deprecated. "
+        "Use Alembic instead:\n\n"
+        "  alembic stamp 0001_baseline   # existing DB only\n"
+        "  alembic upgrade head\n"
+    )
+    sys.exit(1)
 
 
 if __name__ == "__main__":

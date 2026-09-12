@@ -1,12 +1,21 @@
+import logging
 import os
+import re
+try:
+    import resource
+except ImportError:
+    resource = None  # not available on Windows; job resource limits are skipped there
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
+from pythonjsonlogger import jsonlogger
 from sqlalchemy import create_engine, text
 
 
@@ -23,6 +32,38 @@ engine = create_engine(
 
 
 # ============================================================
+# Structured (JSON) logging
+# ============================================================
+#
+# Replaces the previous print()-based logging. JSON lines are
+# straightforward to ship into a log aggregator (CloudWatch, Loki,
+# ELK, etc.) and to grep/filter by field (worker_id, job_id, event)
+# instead of parsing free-text strings.
+
+logger = logging.getLogger("scheduler.worker")
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(
+    jsonlogger.JsonFormatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+)
+logger.handlers = [_log_handler]
+logger.propagate = False
+
+
+def log(event, level="info", **fields):
+    """
+    Small convenience wrapper so every log line is a structured
+    event (`event="job_completed"`) plus whatever fields are
+    relevant, always tagged with this worker's id.
+    """
+
+    getattr(logger, level)(event, extra={"worker_id": WORKER_ID, **fields})
+
+
+# ============================================================
 # Scheduler configuration
 # ============================================================
 
@@ -34,45 +75,165 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 HEARTBEAT_INTERVAL_SECONDS = 5
 STALE_WORKER_TIMEOUT_SECONDS = 15
 
+# ============================================================
+# Job execution safety limits
+# ============================================================
+#
+# These are defense-in-depth, NOT a full sandbox. A job command
+# still runs as this worker process's user with its network
+# access. For untrusted job submitters, run workers themselves in
+# a locked-down container (no host mounts, restricted network,
+# non-root user, seccomp profile) or move to a container-per-job
+# execution model. What's below only bounds a single runaway job's
+# CPU time and memory so it can't take the whole worker down.
+
+JOB_MAX_MEMORY_MB = int(os.getenv("JOB_MAX_MEMORY_MB", "512"))
+JOB_MAX_CPU_SECONDS = int(os.getenv("JOB_MAX_CPU_SECONDS", "280"))
+JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "300"))
+
+# Best-effort denylist for obviously destructive commands. This is
+# NOT a security boundary (shell quoting/obfuscation defeats it
+# trivially) -- it exists to catch honest mistakes, not a
+# determined attacker. Real isolation belongs at the container/OS
+# level, not in a regex.
+BLOCKED_COMMAND_PATTERNS = [
+    re.compile(pattern)
+    for pattern in [
+        r"rm\s+-rf\s+/(?:\s|$)",
+        r":\(\)\s*\{\s*:\|\s*:\s*&\s*\}\s*;",  # classic fork bomb
+        r"mkfs\.",
+        r"dd\s+if=.*of=/dev/(sd|nvme|hd)",
+    ]
+]
+
+def _apply_job_resource_limits():
+    """
+    Runs inside the child process (via `preexec_fn`) right before
+    exec, so the limits apply to the job's command, not the worker
+    itself.
+    """
+    if resource is None:
+        return
+
+    memory_bytes = JOB_MAX_MEMORY_MB * 1024 * 1024
+    resource.setrlimit(
+        resource.RLIMIT_AS, (memory_bytes, memory_bytes)
+    )
+    resource.setrlimit(
+        resource.RLIMIT_CPU,
+        (JOB_MAX_CPU_SECONDS, JOB_MAX_CPU_SECONDS),
+    )
+
+def command_is_blocked(command: str) -> str | None:
+    """
+    Returns a rejection reason if the command matches a known
+    dangerous pattern, otherwise None.
+    """
+
+    for pattern in BLOCKED_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return f"Command matched blocked pattern: {pattern.pattern}"
+
+    return None
+
+
+# ============================================================
+# Graceful shutdown
+# ============================================================
+#
+# On SIGTERM/SIGINT (e.g. `docker stop`, or this worker being
+# scaled down), stop claiming NEW jobs but let whatever job is
+# already running finish naturally instead of hard-killing it
+# mid-execution -- a half-run shell command can leave things in a
+# worse state than a slightly-late shutdown does. If the container
+# runtime kills the process anyway after its stop timeout, the
+# stale-job recovery path (recover_stale_jobs) still requeues the
+# job normally.
+
+shutdown_event = threading.Event()
+
+
+def _handle_shutdown_signal(signum, _frame):
+    log(
+        "shutdown_signal_received",
+        signal=signal.Signals(signum).name,
+    )
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
 
 # ============================================================
 # Worker registration
 # ============================================================
 
 def register_worker():
+    """
+    Register this worker in the database, retrying briefly if the
+    `workers` table doesn't exist yet.
 
-    with engine.begin() as db:
+    On a fresh `docker compose up`, the `worker` container can start
+    before the `api` container has finished running its Alembic
+    migrations (Compose only waits for the database to be healthy,
+    not for migrations to finish). Rather than crashing and relying
+    on the container's restart policy to paper over that race,
+    retry in-process for a few seconds first.
+    """
 
-        db.execute(
-            text(
-                """
-                INSERT INTO workers (
-                    worker_id,
-                    status,
-                    started_at,
-                    last_heartbeat
+    max_attempts = 10
+    delay_seconds = 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with engine.begin() as db:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO workers (
+                            worker_id,
+                            status,
+                            started_at,
+                            last_heartbeat
+                        )
+                        VALUES (
+                            :worker_id,
+                            'active',
+                            CURRENT_TIMESTAMP,
+                            CURRENT_TIMESTAMP
+                        )
+                        ON CONFLICT (worker_id)
+                        DO UPDATE SET
+                            status = 'active',
+                            last_heartbeat = CURRENT_TIMESTAMP
+                        """
+                    ),
+                    {
+                        "worker_id": WORKER_ID,
+                    },
                 )
-                VALUES (
-                    :worker_id,
-                    'active',
-                    CURRENT_TIMESTAMP,
-                    CURRENT_TIMESTAMP
-                )
-                ON CONFLICT (worker_id)
-                DO UPDATE SET
-                    status = 'active',
-                    last_heartbeat = CURRENT_TIMESTAMP
-                """
-            ),
-            {
-                "worker_id": WORKER_ID,
-            },
-        )
 
-    print(
-        f"[WORKER] Registered worker: {WORKER_ID}",
-        flush=True,
-    )
+            log("worker_registered")
+            return
+
+        except Exception as exc:
+            if attempt == max_attempts:
+                log(
+                    "worker_registration_failed",
+                    level="error",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                raise
+
+            log(
+                "worker_registration_retry",
+                level="warning",
+                attempt=attempt,
+                error=str(exc),
+            )
+            time.sleep(delay_seconds)
 
 
 # ============================================================
@@ -104,10 +265,7 @@ def heartbeat_loop():
 
         except Exception as exc:
 
-            print(
-                f"[WORKER] Heartbeat error: {exc}",
-                flush=True,
-            )
+            log("heartbeat_error", level="warning", error=str(exc))
 
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
@@ -173,12 +331,11 @@ def recover_stale_jobs():
 
         for job in recovered_jobs:
 
-            print(
-                f"[WORKER] Recovered stale job "
-                f"id={job['id']} "
-                f"name={job['name']} "
-                f"from worker={job['old_worker_id']}",
-                flush=True,
+            log(
+                "stale_job_recovered",
+                job_id=job["id"],
+                job_name=job["name"],
+                previous_worker_id=job["old_worker_id"],
             )
 
         return len(recovered_jobs)
@@ -311,16 +468,11 @@ def claim_job():
 
 def execute_job(job):
 
-    print(
-        f"[WORKER] Worker={WORKER_ID} "
-        f"Executing job id={job['id']} "
-        f"name={job['name']}",
-        flush=True,
-    )
-
-    print(
-        f"[WORKER] Command: {job['command']}",
-        flush=True,
+    log(
+        "job_execution_started",
+        job_id=job["id"],
+        job_name=job["name"],
+        command=job["command"],
     )
 
     effective_priority = (
@@ -328,87 +480,123 @@ def execute_job(job):
         + min(job["aging_bonus"], MAX_AGING_BONUS)
     )
 
-    print(
-        f"[WORKER] Priority: {job['priority']} | "
-        f"Aging bonus: {job['aging_bonus']} | "
-        f"Effective priority: {effective_priority}",
-        flush=True,
+    log(
+        "job_priority_computed",
+        job_id=job["id"],
+        base_priority=job["priority"],
+        aging_bonus=job["aging_bonus"],
+        effective_priority=effective_priority,
     )
 
     status = "failed"
     error_message = None
 
     # ========================================================
-    # Execute command
+    # Best-effort safety check before running anything
     # ========================================================
 
-    try:
+    block_reason = command_is_blocked(job["command"])
 
-        result = subprocess.run(
-            job["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
+    if block_reason is not None:
+
+        error_message = block_reason
+
+        log(
+            "job_rejected_blocked_command",
+            level="warning",
+            job_id=job["id"],
+            reason=block_reason,
         )
 
-        if result.returncode == 0:
+    else:
 
-            status = "completed"
+        # ====================================================
+        # Execute command
+        # ====================================================
 
-            print(
-                f"[WORKER] Worker={WORKER_ID} "
-                f"Job {job['id']} completed",
-                flush=True,
+        try:
+
+            result = subprocess.run(
+                job["command"],
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=JOB_TIMEOUT_SECONDS,
+                preexec_fn=(
+                    _apply_job_resource_limits
+                    if os.name == "posix"
+                    else None
+                ),
             )
 
-            if result.stdout:
+            if result.returncode == 0:
 
-                print(
-                    f"[WORKER] Output: "
-                    f"{result.stdout.strip()}",
-                    flush=True,
+                status = "completed"
+
+                log(
+                    "job_completed",
+                    job_id=job["id"],
+                    stdout=(
+                        result.stdout.strip()[:2000]
+                        if result.stdout
+                        else None
+                    ),
                 )
 
-        else:
+            else:
+
+                error_message = (
+                    result.stderr.strip()
+                    if result.stderr
+                    else f"Exit code {result.returncode}"
+                )
+
+                log(
+                    "job_failed",
+                    level="warning",
+                    job_id=job["id"],
+                    exit_code=result.returncode,
+                    error=error_message[:2000],
+                )
+
+        except subprocess.TimeoutExpired:
 
             error_message = (
-                result.stderr.strip()
-                if result.stderr
-                else f"Exit code {result.returncode}"
+                f"Job timed out after {JOB_TIMEOUT_SECONDS} seconds"
             )
 
-            print(
-                f"[WORKER] Worker={WORKER_ID} "
-                f"Job {job['id']} FAILED "
-                f"with exit code {result.returncode}",
-                flush=True,
+            log(
+                "job_failed",
+                level="warning",
+                job_id=job["id"],
+                reason="timeout",
             )
 
-            print(
-                f"[WORKER] Failure reason: {error_message}",
-                flush=True,
+        except MemoryError:
+
+            error_message = (
+                f"Job exceeded memory limit of "
+                f"{JOB_MAX_MEMORY_MB}MB"
             )
 
-    except subprocess.TimeoutExpired:
+            log(
+                "job_failed",
+                level="warning",
+                job_id=job["id"],
+                reason="memory_limit_exceeded",
+            )
 
-        error_message = "Job timed out after 300 seconds"
+        except Exception as exc:
 
-        print(
-            f"[WORKER] Worker={WORKER_ID} "
-            f"Job {job['id']} FAILED: timeout",
-            flush=True,
-        )
+            error_message = str(exc)
 
-    except Exception as exc:
-
-        error_message = str(exc)
-
-        print(
-            f"[WORKER] Worker={WORKER_ID} "
-            f"Job {job['id']} FAILED with error: {exc}",
-            flush=True,
-        )
+            log(
+                "job_failed",
+                level="error",
+                job_id=job["id"],
+                reason="unexpected_error",
+                error=str(exc),
+            )
 
     # ========================================================
     # Update database
@@ -438,11 +626,7 @@ def execute_job(job):
                 },
             )
 
-            print(
-                f"[WORKER] Job {job['id']} "
-                f"marked as COMPLETED in database",
-                flush=True,
-            )
+            log("job_marked_completed", job_id=job["id"])
 
         # ====================================================
         # FAILURE
@@ -495,23 +679,12 @@ def execute_job(job):
                     },
                 )
 
-                print(
-                    f"[WORKER] Job {job['id']} "
-                    f"will be RETRIED",
-                    flush=True,
-                )
-
-                print(
-                    f"[WORKER] Attempt "
-                    f"{job['attempts']} "
-                    f"of {job['max_retries'] + 1}",
-                    flush=True,
-                )
-
-                print(
-                    f"[WORKER] Retry scheduled in "
-                    f"{retry_delay} seconds",
-                    flush=True,
+                log(
+                    "job_scheduled_for_retry",
+                    job_id=job["id"],
+                    attempt=job["attempts"],
+                    max_attempts=job["max_retries"] + 1,
+                    retry_delay_seconds=retry_delay,
                 )
 
             # ================================================
@@ -537,24 +710,37 @@ def execute_job(job):
                     },
                 )
 
-                print(
-                    f"[WORKER] Worker={WORKER_ID} "
-                    f"Job {job['id']} "
-                    f"PERMANENTLY FAILED",
-                    flush=True,
+                log(
+                    "job_permanently_failed",
+                    level="error",
+                    job_id=job["id"],
+                    attempts=job["attempts"],
+                    error=error_message,
                 )
 
-                print(
-                    f"[WORKER] Job {job['id']} "
-                    f"failed after {job['attempts']} attempts",
-                    flush=True,
-                )
 
-                print(
-                    f"[WORKER] Final error: "
-                    f"{error_message}",
-                    flush=True,
-                )
+# ============================================================
+# Deregister worker
+# ============================================================
+
+def deregister_worker():
+    """
+    Best-effort removal of this worker's row on graceful shutdown,
+    so the dashboard doesn't show a worker that's already gone
+    while waiting out the stale-heartbeat timeout.
+    """
+
+    try:
+        with engine.begin() as db:
+            db.execute(
+                text("DELETE FROM workers WHERE worker_id = :worker_id"),
+                {"worker_id": WORKER_ID},
+            )
+
+        log("worker_deregistered")
+
+    except Exception as exc:
+        log("worker_deregister_failed", level="warning", error=str(exc))
 
 
 # ============================================================
@@ -572,17 +758,10 @@ def worker_loop():
 
     heartbeat_thread.start()
 
-    print(
-        f"[WORKER] Worker started: {WORKER_ID}",
-        flush=True,
-    )
+    log("worker_started")
+    log("worker_waiting_for_jobs")
 
-    print(
-        "[WORKER] Waiting for pending jobs...",
-        flush=True,
-    )
-
-    while True:
+    while not shutdown_event.is_set():
 
         try:
 
@@ -590,7 +769,10 @@ def worker_loop():
 
             if job is None:
 
-                time.sleep(2)
+                # Sleep in short increments so a shutdown signal
+                # received while idle is noticed within ~0.2s
+                # instead of waiting out a full 2s sleep.
+                shutdown_event.wait(timeout=2)
 
                 continue
 
@@ -598,12 +780,12 @@ def worker_loop():
 
         except Exception as exc:
 
-            print(
-                f"[WORKER] Worker loop error: {exc}",
-                flush=True,
-            )
+            log("worker_loop_error", level="error", error=str(exc))
 
-            time.sleep(2)
+            shutdown_event.wait(timeout=2)
+
+    log("worker_shutting_down_gracefully")
+    deregister_worker()
 
 
 # ============================================================
