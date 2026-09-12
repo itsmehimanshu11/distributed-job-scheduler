@@ -9,7 +9,7 @@ import docker
 from docker.errors import DockerException
 from threading import Lock
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -1294,7 +1294,7 @@ def create_job(
         priority=job_data.priority,
         next_run_at=None,
         last_error=None,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
         dedupe_key=job_data.dedupe_key,
     )
 
