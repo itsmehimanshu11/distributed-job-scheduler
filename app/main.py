@@ -161,6 +161,14 @@ WORKER_NETWORK = os.getenv(
     "distributedjobscheduler_default",
 )
 
+# Passed through to every dynamically-created worker so scaled-up
+# workers get the same sandbox configuration as the Compose-managed
+# one, rather than silently falling back to unsandboxed subprocess
+# execution.
+WORKER_SANDBOX_MODE = os.getenv("SANDBOX_MODE", "subprocess")
+WORKER_JOB_RUNNER_IMAGE = os.getenv("JOB_RUNNER_IMAGE", "python:3.12-slim")
+WORKER_JOB_NETWORK_DISABLED = os.getenv("JOB_NETWORK_DISABLED", "true")
+
 MIN_WORKERS = 1
 MAX_WORKERS = 32
 
@@ -455,7 +463,21 @@ def create_worker_container(
 
             environment={
                 "DATABASE_URL": database_url,
+                "SANDBOX_MODE": WORKER_SANDBOX_MODE,
+                "JOB_RUNNER_IMAGE": WORKER_JOB_RUNNER_IMAGE,
+                "JOB_NETWORK_DISABLED": WORKER_JOB_NETWORK_DISABLED,
             },
+
+            volumes=(
+                {
+                    "/var/run/docker.sock": {
+                        "bind": "/var/run/docker.sock",
+                        "mode": "rw",
+                    }
+                }
+                if WORKER_SANDBOX_MODE == "docker"
+                else {}
+            ),
 
             labels={
                 "scheduler.managed": "true",
