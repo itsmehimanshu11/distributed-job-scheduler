@@ -1,9 +1,19 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import String, Text, DateTime
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
+
+
+def _utcnow() -> datetime:
+    """
+    Timezone-aware replacement for the deprecated `datetime.utcnow`.
+    Used as an ORM column default (a callable), not called directly
+    here -- SQLAlchemy calls this itself at insert time for any row
+    created without an explicit value for the column.
+    """
+    return datetime.now(timezone.utc)
 
 
 class Worker(Base):
@@ -22,13 +32,13 @@ class Worker(Base):
 
     started_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=_utcnow,
         nullable=False,
     )
 
     last_heartbeat: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=_utcnow,
         nullable=False,
     )
 
@@ -99,7 +109,7 @@ class Job(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=_utcnow,
         nullable=False,
     )
 
