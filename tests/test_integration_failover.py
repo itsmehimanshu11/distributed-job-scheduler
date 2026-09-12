@@ -22,7 +22,7 @@ failing, since they need a real Postgres to talk to.
 
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -114,7 +114,7 @@ class TestStaleWorkerFailover:
                 db,
                 dead_worker_id,
                 # Already older than the (zero-second) stale timeout.
-                last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+                last_heartbeat=datetime.now(timezone.utc) - timedelta(seconds=30),
             )
 
             # Simulate the dead worker having claimed the job right
