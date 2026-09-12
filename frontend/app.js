@@ -1,5 +1,5 @@
 const API_URL = "http://localhost:8000";
-const API_KEY = "BxOEw4OW6eQmHefRV3YO1a4ijWBUeJv0EJMvj4ulReE";
+const API_KEY = "Zzxv_HtNjpR9Ya0MVZFkFV5clTu8_E_bbLG7jVNhNWw";
 
 let allJobs = [];
 let allWorkers = [];
