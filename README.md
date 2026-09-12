@@ -8,7 +8,7 @@ Submit jobs (shell commands) through a REST API or dashboard. Jobs are stored in
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![Docker](https://img.shields.io/badge/docker-required-2496ED)
-![Tests](https://img.shields.io/badge/tests-14%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-20%20passing-brightgreen)
 
 ---
 
@@ -111,7 +111,7 @@ Building this from scratch — rather than reaching for Celery — forces engage
 - 🔑 **API key authentication** on all write endpoints (constant-time comparison, avoiding timing side-channels)
 - 🎯 **Idempotent job submission** — an optional `dedupe_key` (backed by a real unique DB constraint, not just an app-level check) makes retried submissions safe
 - 🚦 **Rate limiting** on job-creation and worker-scaling endpoints
-- 🧱 **Per-job resource limits** (CPU/memory) and a denylist for obviously destructive commands — defense in depth, not a full sandbox
+- 🧱 **Container-per-job sandboxing** (opt-in `SANDBOX_MODE=docker`) — each job runs in a disposable, network-isolated, non-root, read-only container, with CPU/memory limits and a denylist as additional layers
 - 📈 **Structured JSON logging + Prometheus metrics** (`/metrics`), with separate liveness (`/healthz`) and readiness (`/readyz`) probes
 - 🗃️ **Alembic migrations** for schema changes
 - 📊 **REST API** with full OpenAPI/Swagger docs at `/docs`
@@ -266,9 +266,12 @@ curl -X POST http://localhost:8000/jobs \
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
 | `RATE_LIMIT_MAX_REQUESTS` | Requests per client IP per window | `60` |
 | `RATE_LIMIT_WINDOW_SECONDS` | Rate-limit window length | `60` |
-| `JOB_MAX_MEMORY_MB` | Memory cap per job process | `512` |
-| `JOB_MAX_CPU_SECONDS` | CPU-time cap per job process | `280` |
+| `JOB_MAX_MEMORY_MB` | Memory cap per job process/container | `512` |
+| `JOB_MAX_CPU_SECONDS` | CPU-time cap per job process/container | `280` |
 | `JOB_TIMEOUT_SECONDS` | Wall-clock timeout before a job is killed | `300` |
+| `SANDBOX_MODE` | `subprocess` or `docker` — see [Security notes](#security-notes) | `subprocess` (`docker` in `docker-compose.yml`) |
+| `JOB_RUNNER_IMAGE` | Image used to run each job when `SANDBOX_MODE=docker` | `python:3.12-slim` |
+| `JOB_NETWORK_DISABLED` | Disable networking inside the job container | `true` |
 
 ## Database migrations
 
@@ -283,7 +286,21 @@ alembic revision --autogenerate -m "describe change"  # after a model change
 python -m pytest -v
 ```
 
-14 tests: mocked unit tests (`test_auth.py`, `test_worker.py`) plus real-database integration tests (`test_integration_failover.py`) covering stale-worker failover, no-double-claim guarantees, and idempotent submission under a concurrent-insert race.
+14 tests: mocked unit tests (`test_auth.py`, `test_worker.py`) plus a container-sandbox suite (`test_sandbox.py`, mocked Docker client — no daemon required in CI) plus real-database integration tests (`test_integration_failover.py`) covering stale-worker failover, no-double-claim guarantees, and idempotent submission under a concurrent-insert race. 20 tests total.
+
+### Verifying the sandbox for real
+
+`test_sandbox.py` proves the isolation flags are *sent* to Docker correctly, but a real end-to-end proof needs an actual Docker daemon (which CI doesn't run against). To verify it yourself:
+
+```bash
+# with SANDBOX_MODE=docker (the docker-compose.yml default), submit
+# a job that tries to reach the network or read the host filesystem:
+curl -X POST http://localhost:8000/jobs \
+  -H "X-API-Key: your-secret-key" -H "Content-Type: application/json" \
+  -d '{"name": "sandbox-check", "command": "curl -m 3 https://example.com || echo NETWORK-BLOCKED"}'
+```
+
+With `JOB_NETWORK_DISABLED=true` (the default), the job's output should show `NETWORK-BLOCKED` — proof the container genuinely has no network access, not just a claim in a comment.
 
 ---
 
@@ -294,24 +311,27 @@ python -m pytest -v
 - **Priority aging** prevents starvation: a job's effective priority increases the longer it waits, so a constant stream of high-priority jobs can't indefinitely block low-priority ones.
 - **Idempotency via a real unique constraint**, not just an app-level lookup — closes the race where two near-simultaneous requests with the same `dedupe_key` could otherwise both insert.
 - **Graceful shutdown**: a worker stops claiming new jobs on `SIGTERM` but lets its current job finish, rather than killing it mid-execution and leaving external side effects half-done.
+- **Container-per-job sandboxing is opt-in via config, not hardcoded**: `SANDBOX_MODE` lets the same worker code run fully isolated (Docker) or fast-and-simple (subprocess) depending on deployment trust level, with automatic fallback to subprocess if the Docker socket isn't reachable rather than failing every job outright.
 
 ## Security notes
 
 Being upfront about what is and isn't handled:
 
-- **Job commands run as real shell commands.** The API key is the only real gate on `POST /jobs` — treat it like a root credential. CPU/memory limits and a small denylist exist as defense-in-depth, not a security boundary. Real isolation would mean container-per-job execution.
+- **Job commands run as real commands.** With `SANDBOX_MODE=docker` (the `docker-compose.yml` default), each job runs inside a fresh, disposable container — no network by default (`JOB_NETWORK_DISABLED=true`), a non-root user (`nobody`), a read-only root filesystem, `no-new-privileges`, and hard CPU/memory limits. The container is always removed after the job finishes, win or lose. With `SANDBOX_MODE=subprocess` (the default outside Compose), commands run directly on the worker's own OS, bounded only by CPU/memory `RLIMIT`s — fine for trusted/personal use, not for untrusted submitters.
+- **The API key remains the primary gate** on who can submit a job at all — treat it like a root credential regardless of sandbox mode.
+- **A small denylist** for a few obviously destructive patterns (`rm -rf /`, fork bombs) exists as an extra layer, not a substitute for the sandbox — it's easily defeated by a determined attacker and isn't meant to be relied on alone.
 - **Single static API key** is fine for personal/internal use; a multi-tenant deployment would need per-client, revocable, hashed-at-rest keys.
 - **No TLS termination here** — put this behind a reverse proxy in any real deployment.
 
 ## Roadmap
 
-- Container-per-job execution (real sandboxing)
 - Redis or `LISTEN/NOTIFY`-based push instead of polling
 - Job scheduling (cron-style/delayed jobs), job dependencies/DAGs
 - Dead-letter queue for permanently failed jobs
 - Per-client API keys / OAuth
 - Grafana dashboard on top of `/metrics`
 - Kubernetes manifests, horizontal autoscaling on queue depth
+- Published load-test numbers (throughput at N workers)
 
 ## License
 

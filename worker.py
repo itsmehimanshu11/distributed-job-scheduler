@@ -79,17 +79,189 @@ STALE_WORKER_TIMEOUT_SECONDS = 15
 # Job execution safety limits
 # ============================================================
 #
-# These are defense-in-depth, NOT a full sandbox. A job command
-# still runs as this worker process's user with its network
-# access. For untrusted job submitters, run workers themselves in
-# a locked-down container (no host mounts, restricted network,
-# non-root user, seccomp profile) or move to a container-per-job
-# execution model. What's below only bounds a single runaway job's
-# CPU time and memory so it can't take the whole worker down.
+# These RLIMIT-based caps apply in SANDBOX_MODE=subprocess (job
+# commands run directly on the worker's own OS). They are
+# defense-in-depth, NOT a full sandbox in that mode -- a job still
+# runs as this worker process's user with its network access. For
+# untrusted job submitters, use SANDBOX_MODE=docker instead (see
+# below), which runs each job in an isolated, disposable container.
 
 JOB_MAX_MEMORY_MB = int(os.getenv("JOB_MAX_MEMORY_MB", "512"))
 JOB_MAX_CPU_SECONDS = int(os.getenv("JOB_MAX_CPU_SECONDS", "280"))
 JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "300"))
+
+# ============================================================
+# Sandboxed (container-per-job) execution
+# ============================================================
+#
+# SANDBOX_MODE=subprocess (default): runs the job command directly
+# on the worker's own OS via subprocess, bounded only by the
+# resource limits above. Fine for trusted/internal use.
+#
+# SANDBOX_MODE=docker: runs the job command inside a fresh,
+# disposable container instead -- no access to the worker's
+# filesystem, no network by default, a non-root user, and a
+# read-only root filesystem. This is real isolation, not just a
+# resource cap, and is what makes it reasonable to accept job
+# submissions from less-trusted callers.
+#
+# Docker mode requires the worker to have access to a Docker
+# socket (see docker-compose.yml: mounting /var/run/docker.sock
+# into the worker container). If the socket isn't reachable,
+# docker mode logs a warning once and falls back to subprocess
+# mode rather than silently failing every job.
+
+SANDBOX_MODE = os.getenv("SANDBOX_MODE", "subprocess").strip().lower()
+JOB_RUNNER_IMAGE = os.getenv("JOB_RUNNER_IMAGE", "python:3.12-slim")
+JOB_NETWORK_DISABLED = os.getenv("JOB_NETWORK_DISABLED", "true").lower() == "true"
+
+try:
+    import docker as docker_sdk
+except ImportError:
+    docker_sdk = None
+
+_docker_client = None
+_docker_client_init_failed = False
+
+
+def _get_docker_client():
+    """
+    Lazily creates (and caches) a Docker client for sandboxed
+    execution. Returns None if Docker isn't available, logging the
+    reason exactly once so the worker doesn't spam logs on every
+    job while running in subprocess fallback.
+    """
+
+    global _docker_client, _docker_client_init_failed
+
+    if _docker_client is not None:
+        return _docker_client
+
+    if _docker_client_init_failed:
+        return None
+
+    if docker_sdk is None:
+        log(
+            "docker_sandbox_unavailable",
+            level="warning",
+            reason="docker SDK not installed",
+        )
+        _docker_client_init_failed = True
+        return None
+
+    try:
+        client = docker_sdk.from_env()
+        client.ping()
+        _docker_client = client
+        return _docker_client
+
+    except Exception as exc:
+        log(
+            "docker_sandbox_unavailable",
+            level="warning",
+            reason=str(exc),
+        )
+        _docker_client_init_failed = True
+        return None
+
+
+def run_job_in_container(command: str):
+    """
+    Executes `command` inside a fresh, disposable container.
+
+    Returns a dict shaped like a subprocess.CompletedProcess for a
+    uniform interface with run_job_subprocess: {returncode, stdout,
+    stderr}. Raises the same exceptions execute_job() already
+    handles (TimeoutError, generic Exception) so the calling logic
+    doesn't need to know which backend ran the job.
+    """
+
+    client = _get_docker_client()
+
+    if client is None:
+        raise RuntimeError(
+            "Docker sandbox requested but unavailable "
+            "(falling back to subprocess mode)"
+        )
+
+    container = client.containers.run(
+        image=JOB_RUNNER_IMAGE,
+        command=["sh", "-c", command],
+        detach=True,
+        remove=False,
+        network_disabled=JOB_NETWORK_DISABLED,
+        mem_limit=f"{JOB_MAX_MEMORY_MB}m",
+        # cpu_period/cpu_quota together cap CPU as a fraction of a
+        # core over each 100ms period, e.g. quota=50000 with the
+        # default 100000 period caps usage at 0.5 CPU cores.
+        cpu_period=100000,
+        cpu_quota=100000,
+        user="nobody",
+        read_only=True,
+        # The job may still need to write temp files even though
+        # the root filesystem is read-only.
+        tmpfs={"/tmp": "size=64m"},
+        security_opt=["no-new-privileges"],
+        labels={"scheduler.managed": "job-sandbox"},
+    )
+
+    try:
+        result = container.wait(timeout=JOB_TIMEOUT_SECONDS)
+        exit_code = result.get("StatusCode", 1)
+
+        logs = container.logs(stdout=True, stderr=True).decode(
+            "utf-8", errors="replace"
+        )
+
+        return {
+            "returncode": exit_code,
+            "stdout": logs,
+            "stderr": "" if exit_code == 0 else logs,
+        }
+
+    except Exception as exc:
+        # docker-py raises on a wait() timeout among other things;
+        # normalize to the same TimeoutError execute_job() already
+        # catches for the subprocess path.
+        if "timeout" in str(exc).lower():
+            raise TimeoutError(
+                f"Job timed out after {JOB_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        raise
+
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+
+
+def run_job_subprocess(command: str):
+    """
+    Executes `command` directly on the worker's own OS via
+    subprocess, bounded by the RLIMIT-based resource caps. Returns
+    the same {returncode, stdout, stderr} shape as
+    run_job_in_container for a uniform call site.
+    """
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=JOB_TIMEOUT_SECONDS,
+        preexec_fn=(
+            _apply_job_resource_limits
+            if os.name == "posix"
+            else None
+        ),
+    )
+
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 # Best-effort denylist for obviously destructive commands. This is
 # NOT a security boundary (shell quoting/obfuscation defeats it
@@ -511,34 +683,39 @@ def execute_job(job):
     else:
 
         # ====================================================
-        # Execute command
+        # Execute command (sandboxed container or subprocess)
         # ====================================================
+
+        use_docker = SANDBOX_MODE == "docker"
 
         try:
 
-            result = subprocess.run(
-                job["command"],
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=JOB_TIMEOUT_SECONDS,
-                preexec_fn=(
-                    _apply_job_resource_limits
-                    if os.name == "posix"
-                    else None
-                ),
-            )
+            if use_docker:
+                try:
+                    result = run_job_in_container(job["command"])
+                except RuntimeError:
+                    # Docker unavailable -- fall back rather than
+                    # fail every job outright.
+                    log(
+                        "job_sandbox_fallback",
+                        level="warning",
+                        job_id=job["id"],
+                    )
+                    result = run_job_subprocess(job["command"])
+            else:
+                result = run_job_subprocess(job["command"])
 
-            if result.returncode == 0:
+            if result["returncode"] == 0:
 
                 status = "completed"
 
                 log(
                     "job_completed",
                     job_id=job["id"],
+                    sandbox="docker" if use_docker else "subprocess",
                     stdout=(
-                        result.stdout.strip()[:2000]
-                        if result.stdout
+                        result["stdout"].strip()[:2000]
+                        if result["stdout"]
                         else None
                     ),
                 )
@@ -546,20 +723,20 @@ def execute_job(job):
             else:
 
                 error_message = (
-                    result.stderr.strip()
-                    if result.stderr
-                    else f"Exit code {result.returncode}"
+                    result["stderr"].strip()
+                    if result["stderr"]
+                    else f"Exit code {result['returncode']}"
                 )
 
                 log(
                     "job_failed",
                     level="warning",
                     job_id=job["id"],
-                    exit_code=result.returncode,
+                    exit_code=result["returncode"],
                     error=error_message[:2000],
                 )
 
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, TimeoutError):
 
             error_message = (
                 f"Job timed out after {JOB_TIMEOUT_SECONDS} seconds"
