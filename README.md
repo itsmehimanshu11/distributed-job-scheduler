@@ -1,498 +1,195 @@
-# ⚡ Distributed Job Scheduler
+# ⚡ Distributed Job Scheduler — Beginner's Guide
 
-A distributed background job scheduling system with **live worker fleet control**, built with **Python, FastAPI, PostgreSQL, Docker, and a real-time web dashboard**.
-
-You submit jobs (shell commands) through a REST API or the dashboard. Jobs are stored in PostgreSQL and picked up by one or more **worker containers**, which claim, execute, and report on them. You can scale the number of workers up or down live from the dashboard — Docker containers are created or removed on demand, and any job that was mid-execution on a removed worker is automatically requeued onto a surviving worker instead of getting lost.
-
-![Status](https://img.shields.io/badge/status-active-brightgreen)
-![Python](https://img.shields.io/badge/python-3.12-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
-![Docker](https://img.shields.io/badge/docker-required-2496ED)
+This is a simple explanation of what this project is, why it exists, and exactly how to get it running on your computer, step by step. No prior experience with Docker, databases, or backend systems is assumed.
 
 ---
 
-## Table of contents
+## 1. What is this, in plain English?
 
-- [What this project does](#what-this-project-does)
-- [Screenshot](#screenshot)
-- [Architecture](#architecture)
-- [Features](#features)
-- [Tech stack](#tech-stack)
-- [Project structure](#project-structure)
-- [Requirements](#requirements)
-- [Quick start (Docker — recommended)](#quick-start-docker--recommended)
-- [Manual setup (without Docker)](#manual-setup-without-docker)
-- [Using the dashboard](#using-the-dashboard)
-- [API reference](#api-reference)
-- [Environment variables](#environment-variables)
-- [Running tests](#running-tests)
-- [Continuous integration](#continuous-integration)
-- [Troubleshooting](#troubleshooting)
-- [Design notes](#design-notes)
-- [Roadmap](#roadmap)
+Imagine you have a long list of tasks you need done — like sending 1,000 emails, resizing 500 images, or generating reports every night. You don't want to run them one at a time on your own computer and wait. Instead, you want a system where:
 
----
+- You **submit** each task ("job") to a queue
+- A pool of **workers** (helper programs) picks up jobs from that queue and runs them
+- If a task fails, it **automatically retries**
+- If a worker crashes halfway through a job, another worker **picks up where it left off** instead of the job being lost forever
+- You can add or remove workers on demand, like adding more cashiers at a supermarket when the line gets long
 
-## What this project does
+That's exactly what this project does. It's a miniature, self-hosted version of tools like **Celery** or **Sidekiq** — the same kind of system that powers background tasks at real companies — built from scratch so you can see exactly how it works under the hood.
 
-Think of it as a tiny, self-hosted version of a task queue like Celery or Sidekiq, but built from scratch to understand how distributed job scheduling actually works under the hood:
+## 2. Why does this matter? (Real-world use)
 
-1. You create a **job** — a name plus a shell command to run (e.g. `echo hello`, or a Python script).
-2. The job is stored in **PostgreSQL** with status `pending`.
-3. One or more **worker processes** (each running in its own Docker container) continuously poll the database for pending jobs.
-4. A worker **atomically claims** a job (so two workers never run the same job at once), executes the command, and writes the result back.
-5. Failed jobs are automatically **retried with backoff**, up to a configurable limit.
-6. From the **dashboard**, you can scale the number of workers up or down at any time. If a worker is removed while it's actively running a job, that job is safely **freed and picked up by a remaining worker** instead of being lost.
+This pattern — "submit work, let a pool of workers process it" — is everywhere in real software:
 
----
+- **E-commerce**: sending order confirmation emails, generating invoices
+- **Social media**: resizing/processing uploaded photos and videos in the background
+- **Data teams**: nightly batch jobs, ETL pipelines
+- **AI/ML**: queuing training runs across a fleet of machines
 
-## Screenshot
+Any time an app does something too slow to make you wait for it, there's a system like this working behind the scenes.
 
-*(Add a screenshot of your dashboard here once deployed — e.g. drag an image into this section on GitHub, or reference `docs/dashboard.png`.)*
+## 3. How it's built (the pieces)
 
-```
-![Dashboard screenshot](docs/dashboard.png)
-```
+| Piece | What it does | Analogy |
+|---|---|---|
+| **PostgreSQL (the database)** | Stores every job and its status (pending, running, completed, failed) | A shared to-do list on a whiteboard everyone can see |
+| **API (FastAPI, Python)** | The front desk — lets you submit jobs and check their status over the web | The receptionist who writes new tasks on the whiteboard |
+| **Worker(s)** | Programs that continuously check the whiteboard, grab a task, do it, and report back | The staff actually doing the work |
+| **Dashboard (web page)** | A visual way to submit jobs and watch them happen, instead of typing commands | A TV screen showing the whiteboard live |
+| **Docker** | Packages everything (API, workers, database) into portable containers so it runs the same on any computer | Shipping containers — the contents don't change no matter which ship (computer) carries them |
 
----
+**How a job flows through the system:**
+1. You submit a job through the dashboard or API → it's saved in the database as `pending`
+2. A worker notices it, "claims" it (marks it `running` so no other worker also grabs it), and executes it
+3. If it succeeds → marked `completed`. If it fails → automatically retried a few times before being marked `failed`
+4. If the worker dies mid-job, the system notices (via a heartbeat, like a pulse check) and returns the job to `pending` so another worker can finish it
 
-## Architecture
+## 4. What you need before starting
 
-```
-                         ┌────────────────────┐
-                         │   Web Dashboard     │
-                         │ (HTML/CSS/JS)       │
-                         └──────────┬──────────┘
-                                    │ REST + polling
-                                    ▼
-                         ┌────────────────────┐
-                         │     FastAPI API     │
-                         │  (app/main.py)      │
-                         └──────────┬──────────┘
-                                    │
-                 ┌──────────────────┼───────────────────┐
-                 ▼                  ▼                    ▼
-        ┌────────────────┐ ┌───────────────┐   ┌──────────────────┐
-        │   PostgreSQL    │ │ Docker Engine │   │   Job Table       │
-        │  (job + worker  │ │ (via socket)  │   │  pending/running/ │
-        │   state)        │ │ scale workers │   │  completed/failed │
-        └───────┬─────────┘ └───────┬───────┘   └──────────────────┘
-                │                   │
-                │           creates/removes
-                │                   ▼
-                │        ┌─────────────────────┐
-                └───────►│  Worker Container 1  │
-                │        ├─────────────────────┤
-                └───────►│  Worker Container 2  │
-                │        ├─────────────────────┤
-                └───────►│  Worker Container N  │
-                         └─────────────────────┘
-```
+You only need **one** thing installed:
 
-- The **API never executes jobs itself** — it only manages state and tells Docker to create/remove worker containers.
-- **Workers are disposable.** Scaling down (or deleting a worker from the dashboard) stops and removes its container. Any job that was actively running on it is reset to `pending` so another worker can finish it — nothing gets silently lost.
-- The **database is the coordination point** between workers, using an atomic "claim" operation so two workers can never grab the same pending job.
+- **Docker Desktop** — download it free from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
 
----
+That's it. Docker Desktop includes everything else needed (Python, the database, etc.) already packaged inside the project — you don't need to install Python or PostgreSQL separately for the easy path below.
 
-## Features
+## 5. Running it from scratch — step by step
 
-- 🖥️ **Web dashboard** — create jobs, watch the queue live, scale workers, see per-worker stats, all without touching the terminal
-- 📦 **Bulk job creation** — paste many jobs at once (`name,command,priority,max_retries`, one per line)
-- 🧪 **Built-in job type presets** — echo, timed sleeps, random duration, always-fail, flaky (50%), CPU burn, large output — useful for testing the scheduler itself
-- 🐳 **Dynamic worker scaling** — spin Docker worker containers up or down live from the dashboard or via API (1–32 workers)
-- 🔁 **Requeue-safe worker deletion** — deleting/scaling down a worker mid-job frees that job instead of stranding it
-- ⚖️ **Job priority + priority aging** — higher-priority jobs run first; long-waiting jobs get a priority boost over time
-- ♻️ **Automatic retries with backoff** — failed jobs retry with increasing delay, up to `max_retries`
-- 🩺 **Stale job recovery / failover** — if a worker dies mid-job without cleanup, another worker can pick the job back up
-- 🔑 **API key authentication** on all write endpoints
-- 📊 **REST API** with full OpenAPI/Swagger docs at `/docs`
-- ✅ **Automated tests** (pytest) with CI running on every push via GitHub Actions
+### Step 1: Install and open Docker Desktop
 
----
+Download and install Docker Desktop from the link above. Once installed, **open it** and wait until it says "Docker Desktop is running" (look for a whale icon in your system tray, bottom-right of your screen on Windows).
 
-## Tech stack
+> ⚠️ **This is the single most common thing people forget.** If Docker Desktop isn't open and running, every command below will fail with an error like "cannot connect to the Docker daemon."
 
-| Layer | Technology |
-|---|---|
-| API | Python 3.12, FastAPI, Uvicorn |
-| Database | PostgreSQL 16 |
-| ORM | SQLAlchemy 2.0 |
-| Worker orchestration | Docker SDK for Python |
-| Frontend | Vanilla HTML/CSS/JavaScript (no build step) |
-| Containerization | Docker, Docker Compose |
-| Testing | pytest |
-| CI | GitHub Actions |
+### Step 2: Get the project files
 
----
+If you downloaded this as a ZIP, extract it somewhere simple, like `C:\Projects\dist-job-scheduler` (avoid deeply nested folders like Desktop\OneDrive, which can sometimes cause path issues).
 
-## Project structure
-
-```
-Distributed Job Scheduler/
-│
-├── app/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI app: all REST endpoints
-│   ├── database.py           # DB engine/session setup
-│   └── models.py             # SQLAlchemy models (Job, Worker)
-│
-├── frontend/
-│   ├── index.html            # Dashboard markup
-│   ├── style.css             # Dashboard styling
-│   └── app.js                # Dashboard logic (polling, forms, tables)
-│
-├── tests/
-│   ├── test_auth.py          # API key auth tests
-│   └── test_worker.py        # Worker logic tests
-│
-├── .github/workflows/
-│   └── tests.yml             # CI: runs pytest against a real Postgres service
-│
-├── worker.py                  # The worker process (runs inside each container)
-├── migrate_worker_schema.py   # One-off DB migration helper for the workers table
-├── docker-compose.yml         # Defines api, db, and worker services
-├── Dockerfile                 # Shared image for both api and worker
-├── requirements.txt
-├── .env.example                # Template for your local .env
-└── README.md
-```
-
----
-
-## Requirements
-
-You only need **one** of the two setups below.
-
-### Docker setup (recommended — easiest)
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- Git
-
-### Manual setup (no Docker)
-- Python 3.12+
-- PostgreSQL running locally (or via Docker just for the database)
-- Git
-
----
-
-## Quick start (Docker — recommended)
-
-This is the easiest way to run the whole system — API, database, and one worker — with a single command. **Beginner-friendly, step by step:**
-
-### Step 1 — Install Docker Desktop
-
-Download and install it from [docker.com](https://www.docker.com/products/docker-desktop/), then **open Docker Desktop and make sure it's running** (you'll see a whale icon in your system tray/menu bar).
-
-### Step 2 — Clone the project
+Open a terminal (PowerShell on Windows, Terminal on Mac) and navigate into the folder:
 
 ```powershell
-git clone https://github.com/itsmehimanshu11/distributed-job-scheduler.git
-cd distributed-job-scheduler
+cd path\to\dist-job-scheduler
 ```
 
-### Step 3 — Create your environment file
+### Step 3: Create your configuration file
 
-Copy the example file and fill in your own values:
+Every project like this needs a small file of settings (database password, secret key, etc.) called `.env`. A template is already provided. Copy it:
 
+**Windows (PowerShell):**
 ```powershell
 copy .env.example .env
 ```
 
-*(On macOS/Linux use `cp .env.example .env` instead.)*
-
-Open the new `.env` file in any text editor and set:
-
-```env
-API_KEY=choose-any-secret-string-you-like
+**Mac/Linux:**
+```bash
+cp .env.example .env
 ```
 
-You can leave the database values as-is — Docker Compose uses them automatically.
+Now open the new `.env` file in any text editor. You only need to change **one** line — set your own secret API key:
 
-### Step 4 — Start everything
+```
+API_KEY=choose-any-secret-word-you-like
+```
+
+Leave everything else as-is — the database settings are already configured to match what Docker will set up automatically.
+
+> ⚠️ **Important:** the web dashboard (the visual page in your browser) has its own hardcoded copy of the API key baked into `frontend/app.js` (line 2), separate from `.env`. If you want the dashboard's "Create job" button to work, either leave `API_KEY` in `.env` unset and instead copy the value **from** `app.js` into `.env`, or open `app.js` and change its hardcoded key to match yours. This is a known quirk of the original dashboard design — the API itself always respects `.env`; only the dashboard needs this extra step.
+
+### Step 4: Start everything with one command
 
 ```powershell
 docker compose up -d --build
 ```
 
 This single command:
-- Builds the API and worker Docker images
-- Starts PostgreSQL
+- Builds the API and worker programs
+- Starts the database
 - Starts the API server
 - Starts one worker
 
-Wait about 10–15 seconds for everything to boot, then check that all three containers are running:
+The first time you run it, it may take 1-2 minutes (it's downloading and building things). After that, check everything started correctly:
 
 ```powershell
 docker compose ps
 ```
 
-You should see `api`, `db`, and `worker`, all with status `Up` (or `healthy` for the database).
+You should see three rows — `api`, `db`, and `worker` — all showing `Up` (or `healthy` for the database).
 
-### Step 5 — Open the dashboard
+### Step 5: Open the dashboard
 
-Open your browser and go to:
+Open your web browser and go to:
 
 ```
 http://localhost:8000
 ```
 
-You now have a live dashboard where you can create jobs, scale workers, and watch everything happen in real time.
+You should see the Distributed Job Scheduler dashboard, showing "Connected" and a worker marked active. Try creating a job using one of the built-in presets (e.g. "Echo") and watch it move from Pending → Running → Completed.
 
-### Step 6 — (Optional) Explore the raw API
+### Step 6: Explore the technical API (optional)
 
-FastAPI auto-generates interactive API docs. Open:
+FastAPI automatically builds interactive documentation. Visit:
 
 ```
 http://localhost:8000/docs
 ```
 
-Here you can test every endpoint directly in the browser.
+Here you can try every API endpoint directly from your browser.
 
-### Stopping the project
+### Stopping everything
 
 ```powershell
 docker compose down
 ```
 
-Your data stays saved (in a Docker volume) — running `docker compose up -d` again picks up right where you left off. To wipe the database completely, add `-v`:
+Your data is kept safe in a Docker "volume" — running `docker compose up -d` again later picks up right where you left off. If you ever want to wipe everything and start completely fresh:
 
 ```powershell
 docker compose down -v
 ```
 
----
+## 6. How to verify everything actually works
 
-## Manual setup (without Docker)
+Once it's running, here's a checklist to confirm each feature works:
 
-Use this if you want to run the API and worker directly with Python (useful for development/debugging), while still using Docker just for the database.
+1. **Create a job** on the dashboard → it should move to "Completed" within a couple of seconds
+2. **Scale workers** using the +/− buttons under "Cluster capacity" → a new worker container should appear
+3. **Delete a worker while it's running a job** → the job should not disappear; it gets picked up by a remaining worker instead (this is the core "no job left behind" feature)
+4. **Visit `http://localhost:8000/healthz`** → should show `{"status":"alive"}`
+5. **Visit `http://localhost:8000/metrics`** → should show a page of monitoring statistics
 
-### 1. Clone the project
+## 7. Common problems and fixes
 
-```powershell
-git clone https://github.com/itsmehimanshu11/distributed-job-scheduler.git
-cd distributed-job-scheduler
-```
+| Problem | Likely cause | Fix |
+|---|---|---|
+| `docker compose up` fails with a "pipe" or "daemon" error | Docker Desktop isn't running | Open Docker Desktop and wait for it to fully start, then try again |
+| API container shows a database error about a table "already existing" | An old project/volume with the same name already exists | Run `docker compose down -v` to wipe old data, then `docker compose up -d --build` again |
+| Dashboard shows "401 Unauthorized" when creating a job | The dashboard's built-in key (in `frontend/app.js`) doesn't match your `.env` `API_KEY` | See the note in Step 3 above — make the two match |
+| `password authentication failed for user "scheduler"` when running tests locally | Your `.env` database password doesn't match `docker-compose.yml`'s password | Make sure `.env`'s `DATABASE_URL` uses `scheduler_password` (the value hardcoded in `docker-compose.yml`) |
+| `curl` commands don't work as expected on Windows | PowerShell's `curl` is an alias for a different tool with different syntax | Use `curl.exe` explicitly, or use PowerShell's own `Invoke-WebRequest` |
+| Python commands can't find installed packages | You have multiple Python installations, and `pip install` used a different one than `python` runs | Run `where.exe python` (Windows) to see all installed copies, then call the correct one directly, e.g. `& "C:\path\to\python.exe" -m pytest` |
+| Port 8000 or 5432 already in use | Another program on your computer is using that port | Stop that program, or edit `docker-compose.yml` to use a different port, e.g. `"8001:8000"` |
 
-### 2. Create and activate a virtual environment
+## 8. Running the automated tests (optional, for the curious)
+
+This project includes automated tests that check the system works correctly, including simulating a worker crashing mid-job. To run them, you need Python installed separately (not just Docker):
 
 ```powershell
 python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks the activation script:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-.\venv\Scripts\Activate.ps1
-```
-
-You should see `(venv)` at the start of your terminal prompt.
-
-### 3. Install dependencies
-
-```powershell
+venv\Scripts\activate
 pip install -r requirements.txt
+python -m alembic upgrade head
+python -m pytest -v
 ```
 
-### 4. Set up your `.env` file
+You should see all tests pass (`14 passed`).
 
-```powershell
-copy .env.example .env
-```
+## 9. Glossary — jargon explained simply
 
-Edit `.env` and set an `API_KEY` of your choice.
-
-### 5. Start just the database with Docker
-
-```powershell
-docker compose up -d db
-```
-
-### 6. Start the API
-
-```powershell
-python -m uvicorn app.main:app --reload
-```
-
-The API is now running at `http://127.0.0.1:8000`.
-
-### 7. Start a worker (in a new terminal)
-
-```powershell
-.\venv\Scripts\Activate.ps1
-python worker.py
-```
-
-You should see:
-
-```
-[WORKER] Registered worker: YOUR-MACHINE-1234
-[WORKER] Worker started
-[WORKER] Waiting for pending jobs...
-```
-
-You can repeat step 7 in additional terminals to run more workers manually — each one registers with a unique ID and independently claims jobs.
-
-### 8. Open the dashboard
-
-```
-http://127.0.0.1:8000
-```
+- **API**: A way for programs (or your browser) to talk to the server using structured requests, instead of a visual interface
+- **Container / Docker**: A self-contained package that includes an application and everything it needs to run, so it behaves the same on any computer
+- **Database (PostgreSQL)**: A structured, permanent storage system — where all job and worker information lives
+- **Worker**: A background program that does the actual work (running the job's command)
+- **Migration**: A recorded, versioned change to the database's structure (e.g. "add a new column") — lets you upgrade a database safely over time instead of guessing what state it's in
+- **Idempotent**: Doing something twice has the same effect as doing it once — used here so that accidentally submitting the same job twice doesn't create a duplicate
+- **Rate limiting**: Capping how many requests someone can make in a given time period, to prevent overload or abuse
+- **Failover**: When something breaks, work automatically shifts to a working replacement instead of being lost
 
 ---
-
-## Using the dashboard
-
-Once the dashboard is open at `http://localhost:8000`:
-
-- **Dispatch a job** — fill in a name, pick a job type (or write a custom command), and click **Create jobs**. Use **Bulk** mode to create several different jobs at once by pasting a list.
-- **Cluster capacity** — use `+`/`−` or a preset button, then click **Apply** to scale the number of live worker containers.
-- **Worker fleet** — see every live worker, how many jobs it's completed, and its current status. Select one or more and click **Delete selected** to remove them (their in-flight jobs are automatically handed off to a remaining worker).
-- **Job queue** — search, filter by status, and watch job status update live every couple of seconds.
-
----
-
-## API reference
-
-All write endpoints (creating/deleting jobs or workers) require an `X-API-Key` header matching your `.env` value.
-
-### Jobs
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/jobs` | List all jobs |
-| `POST` | `/jobs` | Create a job |
-| `GET` | `/jobs/{job_id}` | Get one job |
-| `DELETE` | `/jobs/{job_id}` | Delete one job |
-| `DELETE` | `/jobs/all` | Delete every job |
-
-**Create a job:**
-
-```bash
-curl -X POST http://localhost:8000/jobs \
-  -H "X-API-Key: your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "name": "hello-world",
-        "command": "echo Hello from the scheduler!",
-        "priority": 100,
-        "max_retries": 3
-      }'
-```
-
-### Workers
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/workers` | List currently running worker containers |
-| `POST` | `/workers/scale` | Scale to a target worker count (1–32) |
-| `DELETE` | `/workers/{worker_id}` | Remove one specific worker |
-
-**Scale to 4 workers:**
-
-```bash
-curl -X POST http://localhost:8000/workers/scale \
-  -H "X-API-Key: your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"workers": 4}'
-```
-
-### System
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Dashboard (HTML) |
-| `GET` | `/health` | Health check |
-| `GET` | `/docs` | Interactive Swagger API docs |
-
----
-
-## Environment variables
-
-Copy `.env.example` to `.env` and configure:
-
-| Variable | Description | Example |
-|---|---|---|
-| `POSTGRES_USER` | Database username | `scheduler` |
-| `POSTGRES_PASSWORD` | Database password | *(choose your own)* |
-| `POSTGRES_DB` | Database name | `scheduler_db` |
-| `POSTGRES_HOST` | Database host (Docker Compose sets this automatically for containers) | `localhost` |
-| `POSTGRES_PORT` | Database port | `5432` |
-| `DATABASE_URL` | Full SQLAlchemy connection string | `postgresql+psycopg://scheduler:...@localhost:5432/scheduler_db` |
-| `API_KEY` | Secret key required for all write requests | *(choose your own secret)* |
-
-**Never commit your real `.env` file.** It's already excluded via `.gitignore` — only `.env.example` (with placeholder values) should ever be committed.
-
----
-
-## Running tests
-
-```powershell
-python -m pytest -q
-```
-
-Tests require a reachable PostgreSQL database (matching your `DATABASE_URL`), since the app connects to it on import. If you're running tests locally, make sure `docker compose up -d db` is running first.
-
----
-
-## Continuous integration
-
-Every push to `main` automatically runs the test suite via **GitHub Actions** (`.github/workflows/tests.yml`). The workflow spins up a temporary PostgreSQL service container so tests run against a real database, exactly like production — no manual setup needed on GitHub's side. Check the **Actions** tab on the repository to see build status.
-
----
-
-## Troubleshooting
-
-**"Docker Engine unavailable" error from the API**
-Make sure Docker Desktop is actually running before starting the API — worker scaling talks to Docker directly through its socket.
-
-**Dashboard shows "API Offline"**
-Check `docker compose ps` — if the `api` container isn't `Up`, check its logs: `docker compose logs api`.
-
-**Changes to `frontend/` files don't show up in the browser**
-The frontend is baked into the Docker image at build time. After editing `index.html`/`style.css`/`app.js`, rebuild:
-```powershell
-docker compose up -d --build
-```
-Then hard-refresh your browser (`Ctrl+Shift+R`).
-
-**Port 8000 or 5432 already in use**
-Something else on your machine is using that port. Either stop it, or change the port mapping in `docker-compose.yml` (e.g. `"8001:8000"`).
-
-**"Cannot delete the last worker" error**
-By design — the system always keeps at least one worker alive so jobs don't get permanently stranded. Scale up first if you need to replace the last remaining worker.
-
----
-
-## Design notes
-
-- **Atomic job claiming** prevents two workers from ever executing the same pending job — the database transaction guarantees exclusivity.
-- **Requeue-on-delete**: when a worker is removed (via scale-down or explicit delete), the API first stops the container, *then* checks for any job that was actively running on it and resets that job to `pending` before finally removing the container. Stopping before requeuing closes a race condition where the worker could otherwise grab a brand-new job in the gap.
-- **Priority aging** slowly increases the effective priority of jobs that have been waiting a long time, so low-priority jobs don't starve indefinitely behind a constant stream of high-priority ones.
-- **Workers are stateless and disposable** — any worker can be killed and replaced at any time without losing job data, since all state lives in PostgreSQL, not in the worker process.
-
----
-
-## Roadmap
-
-Ideas for future improvement (not yet implemented):
-
-- Redis-based queueing as an alternative backend
-- WebSocket-based live updates (replacing polling)
-- Job scheduling (cron-style / delayed jobs)
-- Job dependencies / DAGs
-- Dead-letter queue for permanently failed jobs
-- Prometheus metrics + Grafana dashboard
-- Kubernetes deployment manifests
-- Horizontal autoscaling based on queue depth
-
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
-
-## Author
-
-Built by [Himanshu](https://github.com/itsmehimanshu11) as a hands-on project exploring distributed systems, background job queues, and container orchestration.

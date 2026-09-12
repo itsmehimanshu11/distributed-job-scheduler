@@ -1,23 +1,143 @@
+import logging
 import os
+import secrets
+import sys
+import time
 import uuid
 import docker
 
 from docker.errors import DockerException
 from threading import Lock
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
+from pythonjsonlogger import jsonlogger
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    CONTENT_TYPE_LATEST,
+    generate_latest,
+)
 
 from .database import engine, get_db, Base
 from .models import Job, Worker
+
+
+# ============================================================
+# STRUCTURED (JSON) LOGGING
+# ============================================================
+#
+# Plain `print()` statements are fine for a laptop demo but are
+# painful to search/alert on in any real deployment. Emitting JSON
+# lines lets this be shipped straight into something like
+# CloudWatch, Loki, or the ELK stack without a custom parser.
+
+logger = logging.getLogger("scheduler.api")
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(
+    jsonlogger.JsonFormatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+)
+logger.handlers = [_log_handler]
+logger.propagate = False
+
+
+# ============================================================
+# PROMETHEUS METRICS
+# ============================================================
+
+JOBS_CREATED_TOTAL = Counter(
+    "scheduler_jobs_created_total",
+    "Number of jobs submitted through the API",
+)
+
+JOBS_DELETED_TOTAL = Counter(
+    "scheduler_jobs_deleted_total",
+    "Number of jobs deleted through the API",
+)
+
+WORKER_SCALE_REQUESTS_TOTAL = Counter(
+    "scheduler_worker_scale_requests_total",
+    "Number of worker scale requests",
+    ["direction"],
+)
+
+HTTP_REQUESTS_TOTAL = Counter(
+    "scheduler_http_requests_total",
+    "Total HTTP requests handled by the API",
+    ["method", "path", "status_code"],
+)
+
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "scheduler_http_request_duration_seconds",
+    "HTTP request latency",
+    ["method", "path"],
+)
+
+JOB_QUEUE_DEPTH = Gauge(
+    "scheduler_job_queue_depth",
+    "Number of jobs currently in each status",
+    ["status"],
+)
+
+
+# ============================================================
+# LIGHTWEIGHT RATE LIMITING
+# ============================================================
+#
+# In-memory sliding-window limiter for write endpoints. This is
+# per-process (not shared across API replicas) -- fine for a
+# single-instance deployment; swap for a Redis-backed limiter
+# (e.g. `slowapi` + Redis) if you run the API horizontally.
+
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "60"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+_rate_limit_lock = Lock()
+_rate_limit_hits: dict[str, deque] = defaultdict(deque)
+
+
+def rate_limit(request: Request):
+    """
+    Simple sliding-window rate limiter keyed by client IP.
+    Raises 429 if the caller exceeds RATE_LIMIT_MAX_REQUESTS
+    within RATE_LIMIT_WINDOW_SECONDS.
+    """
+
+    client_key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+
+    with _rate_limit_lock:
+        hits = _rate_limit_hits[client_key]
+
+        while hits and now - hits[0] > RATE_LIMIT_WINDOW_SECONDS:
+            hits.popleft()
+
+        if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Rate limit exceeded: "
+                    f"{RATE_LIMIT_MAX_REQUESTS} requests per "
+                    f"{RATE_LIMIT_WINDOW_SECONDS}s"
+                ),
+            )
+
+        hits.append(now)
 
 
 # ============================================================
@@ -72,6 +192,49 @@ app.add_middleware(
 
 
 # ============================================================
+# REQUEST LOGGING + METRICS MIDDLEWARE
+# ============================================================
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    start = time.monotonic()
+
+    response = await call_next(request)
+
+    duration = time.monotonic() - start
+    route_path = request.scope.get("route")
+    path_label = (
+        route_path.path if route_path is not None else request.url.path
+    )
+
+    HTTP_REQUESTS_TOTAL.labels(
+        method=request.method,
+        path=path_label,
+        status_code=response.status_code,
+    ).inc()
+
+    HTTP_REQUEST_DURATION_SECONDS.labels(
+        method=request.method,
+        path=path_label,
+    ).observe(duration)
+
+    logger.info(
+        "http_request",
+        extra={
+            "method": request.method,
+            "path": path_label,
+            "status_code": response.status_code,
+            "duration_ms": round(duration * 1000, 2),
+            "client_ip": (
+                request.client.host if request.client else None
+            ),
+        },
+    )
+
+    return response
+
+
+# ============================================================
 # FRONTEND
 # ============================================================
 
@@ -98,6 +261,12 @@ def verify_api_key(
 ):
     """
     Verify the API key supplied through the X-API-Key header.
+
+    Uses `secrets.compare_digest` instead of `==` so the comparison
+    takes constant time regardless of where the strings first differ
+    -- a plain `==` short-circuits character-by-character and can
+    leak timing information an attacker could use to guess the key
+    byte-by-byte.
     """
 
     expected_api_key = os.getenv("API_KEY")
@@ -108,7 +277,13 @@ def verify_api_key(
             detail="API_KEY is not configured",
         )
 
-    if x_api_key != expected_api_key:
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key, expected_api_key
+    ):
+        logger.warning(
+            "auth_failed",
+            extra={"reason": "invalid_or_missing_api_key"},
+        )
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing API key",
@@ -135,6 +310,15 @@ class JobCreate(BaseModel):
         default=3,
         ge=0,
         le=10,
+    )
+
+    # Optional idempotency key. If a job with this dedupe_key already
+    # exists, POST /jobs returns the existing job (200) instead of
+    # creating a duplicate (201). Lets clients safely retry a job
+    # submission after a network timeout without double-running it.
+    dedupe_key: str | None = Field(
+        default=None,
+        max_length=255,
     )
 
 
@@ -575,7 +759,7 @@ def delete_worker(
 
 @app.post(
     "/workers/scale",
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit)],
 )
 def scale_workers(
     request: WorkerScaleRequest,
@@ -595,6 +779,11 @@ def scale_workers(
     """
 
     desired_workers = request.workers
+
+    logger.info(
+        "worker_scale_requested",
+        extra={"desired_workers": desired_workers},
+    )
 
     # Prevent two simultaneous scaling operations.
     with worker_scale_lock:
@@ -637,6 +826,8 @@ def scale_workers(
             # =================================================
 
             if desired_workers > current_workers:
+
+                WORKER_SCALE_REQUESTS_TOTAL.labels(direction="up").inc()
 
                 workers_to_create = (
                     desired_workers - current_workers
@@ -686,6 +877,8 @@ def scale_workers(
             # =================================================
             # SCALE DOWN
             # =================================================
+
+            WORKER_SCALE_REQUESTS_TOTAL.labels(direction="down").inc()
 
             workers_to_remove = (
                 current_workers - desired_workers
@@ -855,6 +1048,9 @@ def health_check(
 ):
     """
     Check API and database health.
+
+    Kept for backwards compatibility -- prefer /healthz (liveness)
+    and /readyz (readiness) for container orchestrators.
     """
 
     db.execute(
@@ -867,9 +1063,75 @@ def health_check(
     }
 
 
+@app.get("/healthz")
+def liveness():
+    """
+    Liveness probe: does NOT touch the database.
+
+    A load balancer / orchestrator uses this to decide whether the
+    process itself is alive and should keep receiving traffic. It
+    should stay fast and dependency-free -- if it queried the DB, a
+    slow database would make a perfectly healthy API process look
+    dead and get killed for the wrong reason.
+    """
+
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+def readiness(
+    db: Session = Depends(get_db),
+):
+    """
+    Readiness probe: confirms the API can actually serve traffic
+    (i.e. the database is reachable). Orchestrators use this to
+    decide whether to route requests to this instance.
+    """
+
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database not ready: {exc}",
+        )
+
+    return {"status": "ready", "database": "connected"}
+
+
+@app.get("/metrics")
+def metrics():
+    """
+    Prometheus scrape endpoint.
+    """
+
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 # ============================================================
 # JOB ROUTES
 # ============================================================
+
+def serialize_job(job: Job) -> dict:
+    return {
+        "id": job.id,
+        "name": job.name,
+        "command": job.command,
+        "status": job.status,
+        "attempts": job.attempts,
+        "max_retries": job.max_retries,
+        "priority": job.priority,
+        "next_run_at": job.next_run_at,
+        "worker_id": job.worker_id,
+        "claimed_at": job.claimed_at,
+        "last_error": job.last_error,
+        "created_at": job.created_at,
+        "dedupe_key": job.dedupe_key,
+    }
+
 
 @app.get("/jobs")
 def list_jobs(
@@ -885,23 +1147,14 @@ def list_jobs(
         .all()
     )
 
-    return [
-        {
-            "id": job.id,
-            "name": job.name,
-            "command": job.command,
-            "status": job.status,
-            "attempts": job.attempts,
-            "max_retries": job.max_retries,
-            "priority": job.priority,
-            "next_run_at": job.next_run_at,
-            "worker_id": job.worker_id,
-            "claimed_at": job.claimed_at,
-            "last_error": job.last_error,
-            "created_at": job.created_at,
-        }
-        for job in jobs
-    ]
+    status_counts = defaultdict(int)
+    for job in jobs:
+        status_counts[job.status] += 1
+
+    for status_label, count in status_counts.items():
+        JOB_QUEUE_DEPTH.labels(status=status_label).set(count)
+
+    return [serialize_job(job) for job in jobs]
 
 
 
@@ -964,20 +1217,7 @@ def get_job(
             detail="Job not found",
         )
 
-    return {
-        "id": job.id,
-        "name": job.name,
-        "command": job.command,
-        "status": job.status,
-        "attempts": job.attempts,
-        "max_retries": job.max_retries,
-        "priority": job.priority,
-        "next_run_at": job.next_run_at,
-        "worker_id": job.worker_id,
-        "claimed_at": job.claimed_at,
-        "last_error": job.last_error,
-        "created_at": job.created_at,
-    }
+    return serialize_job(job)
 
 
 # ============================================================
@@ -987,15 +1227,41 @@ def get_job(
 @app.post(
     "/jobs",
     status_code=201,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit)],
 )
 def create_job(
     job_data: JobCreate,
+    response: Response,
     db: Session = Depends(get_db),
 ):
     """
     Create a new job.
+
+    If `dedupe_key` is supplied and a job with that key already
+    exists, the existing job is returned (status 200) instead of a
+    new one being created (status 201). This makes job submission
+    safe to retry -- e.g. if a client times out waiting for the
+    response but the request actually succeeded, resubmitting with
+    the same dedupe_key will not double-run the job.
     """
+
+    if job_data.dedupe_key:
+        existing = (
+            db.query(Job)
+            .filter(Job.dedupe_key == job_data.dedupe_key)
+            .first()
+        )
+
+        if existing is not None:
+            logger.info(
+                "job_create_deduped",
+                extra={
+                    "job_id": existing.id,
+                    "dedupe_key": job_data.dedupe_key,
+                },
+            )
+            response.status_code = 200
+            return serialize_job(existing)
 
     job = Job(
         name=job_data.name,
@@ -1007,26 +1273,49 @@ def create_job(
         next_run_at=None,
         last_error=None,
         created_at=datetime.utcnow(),
+        dedupe_key=job_data.dedupe_key,
     )
 
     db.add(job)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # Race: another request created a job with the same
+        # dedupe_key between our lookup above and this commit.
+        # Return that job instead of erroring out.
+        db.rollback()
+
+        existing = (
+            db.query(Job)
+            .filter(Job.dedupe_key == job_data.dedupe_key)
+            .first()
+        )
+
+        if existing is not None:
+            response.status_code = 200
+            return serialize_job(existing)
+
+        raise HTTPException(
+            status_code=409,
+            detail="Job with this dedupe_key already exists",
+        )
+
     db.refresh(job)
 
-    return {
-        "id": job.id,
-        "name": job.name,
-        "command": job.command,
-        "status": job.status,
-        "attempts": job.attempts,
-        "max_retries": job.max_retries,
-        "priority": job.priority,
-        "next_run_at": job.next_run_at,
-        "worker_id": job.worker_id,
-        "claimed_at": job.claimed_at,
-        "last_error": job.last_error,
-        "created_at": job.created_at,
-    }
+    JOBS_CREATED_TOTAL.inc()
+
+    logger.info(
+        "job_created",
+        extra={
+            "job_id": job.id,
+            "job_name": job.name,
+            "priority": job.priority,
+            "dedupe_key": job.dedupe_key,
+        },
+    )
+
+    return serialize_job(job)
 
 
 # ============================================================
@@ -1059,6 +1348,10 @@ def delete_job(
 
     db.delete(job)
     db.commit()
+
+    JOBS_DELETED_TOTAL.inc()
+
+    logger.info("job_deleted", extra={"job_id": job_id})
 
     return {
         "message": "Job deleted",
