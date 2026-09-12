@@ -1,4 +1,4 @@
-name: distributedjobscheduler
+﻿name: distributedjobscheduler
 
 services:
 
@@ -51,6 +51,10 @@ services:
       WORKER_IMAGE: distributedjobscheduler-worker:latest
       WORKER_NETWORK: distributedjobscheduler_default
 
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-60}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
@@ -78,18 +82,16 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://scheduler:scheduler_password@db:5432/scheduler_db
 
-      # Container-per-job sandboxing. Set to "subprocess" to run job
-      # commands directly on the worker's own OS instead (faster,
-      # but no isolation beyond the resource caps below) -- see the
-      # README's "Security notes" section for the trade-off.
-      SANDBOX_MODE: docker
-      JOB_RUNNER_IMAGE: python:3.12-slim
-      JOB_NETWORK_DISABLED: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JOB_MAX_MEMORY_MB: ${JOB_MAX_MEMORY_MB:-512}
+      JOB_MAX_CPU_SECONDS: ${JOB_MAX_CPU_SECONDS:-280}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
+
+      SANDBOX_MODE: ${SANDBOX_MODE:-docker}
+      JOB_RUNNER_IMAGE: ${JOB_RUNNER_IMAGE:-python:3.12-slim}
+      JOB_NETWORK_DISABLED: ${JOB_NETWORK_DISABLED:-true}
 
     volumes:
-      # Lets this worker spin up sibling containers for sandboxed
-      # job execution (SANDBOX_MODE=docker). Same pattern the api
-      # service already uses for dynamic worker scaling.
       - /var/run/docker.sock:/var/run/docker.sock
 
     labels:
