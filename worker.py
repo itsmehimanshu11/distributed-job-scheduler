@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 try:
     import resource
 except ImportError:
